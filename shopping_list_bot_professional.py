@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Limpa
-Interface elegante com menos mensagens para não poluir o chat.
+Bot de Lista de Mercado para Telegram - Versão Auto-Limpeza
+Apaga mensagens antigas e mantém apenas o menu principal.
 """
 
 import logging
 import os
+import asyncio
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +17,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from telegram.error import BadRequest
 
 # Configurar logging
 logging.basicConfig(
@@ -24,67 +26,104 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Estados possíveis
+# Estados
 STATE_NONE = 0
 STATE_ADDING = 1
 STATE_REMOVING = 2
 
-# Dicionário para armazenar listas por grupo
+# Armazenamento
 shopping_lists = {}
-# Dicionário para armazenar estados por usuário/chat
 user_states = {}
+messages_to_delete = {}  # Armazena IDs de mensagens para deletar
 
 
 def get_user_state_key(chat_id, user_id):
-    """Gera chave única para estado do usuário"""
     return f"{chat_id}_{user_id}"
 
 
-def get_list_text(items: list, compact: bool = False) -> str:
-    """Formata a lista de compras para exibição"""
+def get_list_text(items: list) -> str:
+    """Formata a lista de compras"""
     if not items:
-        return "📋 *Lista vazia*"
+        return "📋 Lista vazia"
     
-    if compact:
-        # Versão compacta para confirmações
-        items_text = ", ".join(items)
-        return f"📋 *Lista:* {items_text} ({len(items)})"
-    
-    # Versão completa
-    text = "📋 *LISTA DE COMPRAS*\n"
-    text += "━" * 20 + "\n"
-    
+    text = ""
     for i, item in enumerate(items, 1):
         text += f"{i}. {item}\n"
-    
-    text += "━" * 20
-    text += f"\n📊 *{len(items)} item(ns)*"
-    
-    return text
+    return text.strip()
+
+
+def get_main_menu_text(items: list) -> str:
+    """Texto do menu principal com lista"""
+    if items:
+        list_text = get_list_text(items)
+        return f"🛒 *LISTA DE MERCADO*\n━━━━━━━━━━━━━━━\n{list_text}\n━━━━━━━━━━━━━━━\n📊 *{len(items)} item(ns)*"
+    else:
+        return "🛒 *LISTA DE MERCADO*\n━━━━━━━━━━━━━━━\n📋 Lista vazia\n━━━━━━━━━━━━━━━"
 
 
 def get_main_menu_keyboard():
-    """Retorna o teclado do menu principal"""
+    """Teclado do menu principal"""
     keyboard = [
         [
-            InlineKeyboardButton("🛒 Adicionar", callback_data='action_add'),
-            InlineKeyboardButton("📋 Ver Lista", callback_data='action_list')
+            InlineKeyboardButton("➕ Adicionar", callback_data='action_add'),
+            InlineKeyboardButton("➖ Remover", callback_data='action_remove')
         ],
         [
-            InlineKeyboardButton("❌ Remover", callback_data='action_remove'),
-            InlineKeyboardButton("🗑️ Limpar", callback_data='action_clear')
+            InlineKeyboardButton("🗑️ Limpar Tudo", callback_data='action_clear')
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_cancel_keyboard():
-    """Retorna teclado de cancelar (seletivo para grupos)"""
-    return ReplyKeyboardMarkup(
-        [["❌ Cancelar"]], 
-        one_time_keyboard=True,
-        selective=True,
-        resize_keyboard=True
+    """Teclado de cancelar"""
+    keyboard = [[InlineKeyboardButton("❌ Cancelar", callback_data='action_cancel')]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def delete_message_safe(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    """Tenta deletar mensagem de forma segura"""
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except BadRequest as e:
+        logger.debug(f"Não foi possível deletar mensagem: {e}")
+    except Exception as e:
+        logger.debug(f"Erro ao deletar: {e}")
+
+
+async def track_message(chat_id: int, user_id: int, message_id: int):
+    """Rastreia mensagem para deletar depois"""
+    key = get_user_state_key(chat_id, user_id)
+    if key not in messages_to_delete:
+        messages_to_delete[key] = []
+    messages_to_delete[key].append(message_id)
+
+
+async def cleanup_and_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
+    """Limpa mensagens antigas e mostra menu atualizado"""
+    key = get_user_state_key(chat_id, user_id)
+    
+    # Deletar mensagens rastreadas
+    if key in messages_to_delete:
+        for msg_id in messages_to_delete[key]:
+            await delete_message_safe(context, chat_id, msg_id)
+        messages_to_delete[key] = []
+    
+    # Resetar estado
+    user_states[key] = STATE_NONE
+    
+    # Mostrar menu atualizado
+    if chat_id not in shopping_lists:
+        shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+    
+    items = shopping_lists[chat_id]['items']
+    menu_text = get_main_menu_text(items)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=menu_text,
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
     )
 
 
@@ -99,26 +138,32 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("cancel", "Cancelar"),
     ]
     await application.bot.set_my_commands(commands)
-    logger.info("✅ Menu de comandos configurado!")
+    logger.info("✅ Comandos configurados!")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /start"""
+    """Comando /start - Menu principal"""
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
     
     if chat_id not in shopping_lists:
         shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
     
-    items = shopping_lists[chat_id]['items']
+    # Resetar estado
+    state_key = get_user_state_key(chat_id, user_id)
+    user_states[state_key] = STATE_NONE
     
-    if items:
-        list_preview = get_list_text(items, compact=True)
-        welcome_text = f"🛒 *Lista de Mercado*\n\n{list_preview}\n\nEscolha:"
-    else:
-        welcome_text = "🛒 *Lista de Mercado*\n\n📋 Lista vazia\n\nEscolha:"
+    items = shopping_lists[chat_id]['items']
+    menu_text = get_main_menu_text(items)
+    
+    # Deletar comando do usuário
+    try:
+        await update.message.delete()
+    except:
+        pass
     
     await update.message.reply_text(
-        welcome_text, 
+        menu_text,
         parse_mode='Markdown',
         reply_markup=get_main_menu_keyboard()
     )
@@ -132,13 +177,23 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
     
     items = shopping_lists[chat_id]['items']
-    list_text = get_list_text(items)
+    menu_text = get_main_menu_text(items)
     
-    await update.message.reply_text(list_text, parse_mode='Markdown')
+    # Deletar comando
+    try:
+        await update.message.delete()
+    except:
+        pass
+    
+    await update.message.reply_text(
+        menu_text,
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
+    )
 
 
 async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /add - Inicia adição de item"""
+    """Comando /add"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
@@ -148,17 +203,21 @@ async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     state_key = get_user_state_key(chat_id, user_id)
     user_states[state_key] = STATE_ADDING
+    messages_to_delete[state_key] = []
     
-    await update.message.reply_text(
-        f"📝 *{user_name}*, digite o item:",
+    # Rastrear comando do usuário
+    await track_message(chat_id, user_id, update.message.message_id)
+    
+    msg = await update.message.reply_text(
+        f"📝 *{user_name}*, digite o item a adicionar:",
         parse_mode='Markdown',
-        reply_markup=get_cancel_keyboard(),
-        reply_to_message_id=update.message.message_id
+        reply_markup=get_cancel_keyboard()
     )
+    await track_message(chat_id, user_id, msg.message_id)
 
 
 async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /remove - Inicia remoção"""
+    """Comando /remove"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name
@@ -169,36 +228,57 @@ async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     items = shopping_lists[chat_id]['items']
     
     if not items:
-        await update.message.reply_text("📋 *Lista vazia!*", parse_mode='Markdown')
+        try:
+            await update.message.delete()
+        except:
+            pass
+        msg = await update.message.reply_text("📋 *Lista vazia!*", parse_mode='Markdown')
+        await asyncio.sleep(2)
+        try:
+            await msg.delete()
+        except:
+            pass
         return
     
     state_key = get_user_state_key(chat_id, user_id)
     user_states[state_key] = STATE_REMOVING
+    messages_to_delete[state_key] = []
+    
+    await track_message(chat_id, user_id, update.message.message_id)
     
     list_text = get_list_text(items)
-    
-    await update.message.reply_text(
-        f"{list_text}\n\n🗑️ *{user_name}*, qual número remover?",
+    msg = await update.message.reply_text(
+        f"📋 *Lista:*\n{list_text}\n\n🗑️ *{user_name}*, digite o número:",
         parse_mode='Markdown',
-        reply_markup=get_cancel_keyboard(),
-        reply_to_message_id=update.message.message_id
+        reply_markup=get_cancel_keyboard()
     )
+    await track_message(chat_id, user_id, msg.message_id)
 
 
 async def clear_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /clear - Limpa a lista"""
+    """Comando /clear"""
     chat_id = update.effective_chat.id
     
     if chat_id not in shopping_lists:
         shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
     
+    try:
+        await update.message.delete()
+    except:
+        pass
+    
     if not shopping_lists[chat_id]['items']:
-        await update.message.reply_text("📋 *Lista já está vazia!*", parse_mode='Markdown')
+        msg = await update.message.reply_text("📋 *Lista já está vazia!*", parse_mode='Markdown')
+        await asyncio.sleep(2)
+        try:
+            await msg.delete()
+        except:
+            pass
         return
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ Sim", callback_data='confirm_clear'),
+            InlineKeyboardButton("✅ Sim, limpar", callback_data='confirm_clear'),
             InlineKeyboardButton("❌ Não", callback_data='cancel_clear')
         ]
     ]
@@ -215,18 +295,12 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
-    state_key = get_user_state_key(chat_id, user_id)
-    user_states[state_key] = STATE_NONE
-    
-    await update.message.reply_text(
-        "❌ *Cancelado*",
-        parse_mode='Markdown',
-        reply_markup=ReplyKeyboardRemove(selective=True)
-    )
+    await track_message(chat_id, user_id, update.message.message_id)
+    await cleanup_and_show_menu(update, context, chat_id, user_id)
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processa mensagens de texto baseado no estado do usuário"""
+    """Processa mensagens de texto"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     text = update.message.text.strip()
@@ -235,58 +309,43 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     state_key = get_user_state_key(chat_id, user_id)
     current_state = user_states.get(state_key, STATE_NONE)
     
-    # Se não está em nenhum estado, ignorar
+    # Ignorar se não está em nenhum estado
     if current_state == STATE_NONE:
         return
     
-    # Cancelamento
-    if text.lower() in ["❌ cancelar", "cancelar"]:
-        user_states[state_key] = STATE_NONE
-        await update.message.reply_text(
-            "❌ *Cancelado*",
-            parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove(selective=True)
-        )
-        return
+    # Rastrear mensagem do usuário
+    await track_message(chat_id, user_id, update.message.message_id)
     
-    # ADICIONANDO ITEM
+    # ADICIONANDO
     if current_state == STATE_ADDING:
         if chat_id not in shopping_lists:
             shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
         
         if len(text) < 2:
-            await update.message.reply_text(
-                "❌ *Muito curto!*",
-                parse_mode='Markdown',
-                reply_to_message_id=update.message.message_id
-            )
+            msg = await update.message.reply_text("❌ *Muito curto!*", parse_mode='Markdown')
+            await track_message(chat_id, user_id, msg.message_id)
             return
         
         # Verificar duplicata
         items_lower = [item.lower() for item in shopping_lists[chat_id]['items']]
         if text.lower() in items_lower:
-            user_states[state_key] = STATE_NONE
-            await update.message.reply_text(
-                f"⚠️ *'{text}' já está na lista!*",
-                parse_mode='Markdown',
-                reply_markup=ReplyKeyboardRemove(selective=True)
-            )
+            msg = await update.message.reply_text(f"⚠️ *'{text}' já existe!*", parse_mode='Markdown')
+            await track_message(chat_id, user_id, msg.message_id)
+            await asyncio.sleep(1.5)
+            await cleanup_and_show_menu(update, context, chat_id, user_id)
             return
         
-        # Adicionar
+        # Adicionar item
         shopping_lists[chat_id]['items'].append(text)
-        user_states[state_key] = STATE_NONE
         
-        total = len(shopping_lists[chat_id]['items'])
+        # Feedback rápido
+        msg = await update.message.reply_text(f"✅ *+{text}*", parse_mode='Markdown')
+        await track_message(chat_id, user_id, msg.message_id)
         
-        # UMA SÓ MENSAGEM com confirmação
-        await update.message.reply_text(
-            f"✅ *+{text}* (total: {total})",
-            parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove(selective=True)
-        )
+        await asyncio.sleep(1)
+        await cleanup_and_show_menu(update, context, chat_id, user_id)
     
-    # REMOVENDO ITEM
+    # REMOVENDO
     elif current_state == STATE_REMOVING:
         if chat_id not in shopping_lists:
             shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
@@ -297,31 +356,21 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             index = int(text) - 1
             
             if index < 0 or index >= len(items):
-                await update.message.reply_text(
-                    f"❌ *1 a {len(items)}!*",
-                    parse_mode='Markdown',
-                    reply_to_message_id=update.message.message_id
-                )
+                msg = await update.message.reply_text(f"❌ *1 a {len(items)}!*", parse_mode='Markdown')
+                await track_message(chat_id, user_id, msg.message_id)
                 return
             
             removed_item = items.pop(index)
-            user_states[state_key] = STATE_NONE
             
-            total = len(items)
+            msg = await update.message.reply_text(f"✅ *-{removed_item}*", parse_mode='Markdown')
+            await track_message(chat_id, user_id, msg.message_id)
             
-            # UMA SÓ MENSAGEM
-            await update.message.reply_text(
-                f"✅ *-{removed_item}* (restam: {total})",
-                parse_mode='Markdown',
-                reply_markup=ReplyKeyboardRemove(selective=True)
-            )
+            await asyncio.sleep(1)
+            await cleanup_and_show_menu(update, context, chat_id, user_id)
             
         except ValueError:
-            await update.message.reply_text(
-                "❌ *Digite o número!*",
-                parse_mode='Markdown',
-                reply_to_message_id=update.message.message_id
-            )
+            msg = await update.message.reply_text("❌ *Digite o número!*", parse_mode='Markdown')
+            await track_message(chat_id, user_id, msg.message_id)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -341,21 +390,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
         
         user_states[state_key] = STATE_ADDING
+        messages_to_delete[state_key] = []
         
-        await query.message.reply_text(
-            f"📝 *{user_name}*, digite o item:",
+        # Editar mensagem do menu para virar prompt
+        await query.edit_message_text(
+            f"📝 *{user_name}*, digite o item a adicionar:",
             parse_mode='Markdown',
             reply_markup=get_cancel_keyboard()
         )
-    
-    # VER LISTA
-    elif query.data == 'action_list':
-        if chat_id not in shopping_lists:
-            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
-        
-        items = shopping_lists[chat_id]['items']
-        list_text = get_list_text(items)
-        await query.message.reply_text(list_text, parse_mode='Markdown')
+        await track_message(chat_id, user_id, query.message.message_id)
     
     # REMOVER
     elif query.data == 'action_remove':
@@ -365,18 +408,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         items = shopping_lists[chat_id]['items']
         
         if not items:
-            await query.message.reply_text("📋 *Lista vazia!*", parse_mode='Markdown')
+            await query.edit_message_text(
+                "📋 *Lista vazia!*\n\nUse ➕ Adicionar para começar.",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
             return
         
         user_states[state_key] = STATE_REMOVING
+        messages_to_delete[state_key] = []
         
         list_text = get_list_text(items)
-        
-        await query.message.reply_text(
-            f"{list_text}\n\n🗑️ *{user_name}*, qual número?",
+        await query.edit_message_text(
+            f"📋 *Lista:*\n{list_text}\n\n🗑️ *{user_name}*, digite o número:",
             parse_mode='Markdown',
             reply_markup=get_cancel_keyboard()
         )
+        await track_message(chat_id, user_id, query.message.message_id)
     
     # LIMPAR
     elif query.data == 'action_clear':
@@ -384,7 +432,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
         
         if not shopping_lists[chat_id]['items']:
-            await query.message.reply_text("📋 *Lista vazia!*", parse_mode='Markdown')
+            await query.edit_message_text(
+                "📋 *Lista já está vazia!*",
+                parse_mode='Markdown',
+                reply_markup=get_main_menu_keyboard()
+            )
             return
         
         keyboard = [
@@ -394,10 +446,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ]
         ]
         
-        await query.message.reply_text(
+        await query.edit_message_text(
             "⚠️ *Limpar toda a lista?*",
             parse_mode='Markdown',
             reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    # CANCELAR
+    elif query.data == 'action_cancel':
+        user_states[state_key] = STATE_NONE
+        
+        if chat_id not in shopping_lists:
+            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+        
+        items = shopping_lists[chat_id]['items']
+        menu_text = get_main_menu_text(items)
+        
+        # Limpar mensagens rastreadas (exceto o menu atual)
+        if state_key in messages_to_delete:
+            for msg_id in messages_to_delete[state_key]:
+                if msg_id != query.message.message_id:
+                    await delete_message_safe(context, chat_id, msg_id)
+            messages_to_delete[state_key] = []
+        
+        await query.edit_message_text(
+            menu_text,
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
         )
     
     # CONFIRMAR LIMPEZA
@@ -406,13 +481,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
         
         shopping_lists[chat_id]['items'] = []
+        
+        menu_text = get_main_menu_text([])
         await query.edit_message_text(
-            f"🗑️ *Lista limpa por {user_name}!*",
-            parse_mode='Markdown'
+            f"🗑️ *Lista limpa!*\n\n{menu_text}",
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
         )
     
+    # CANCELAR LIMPEZA
     elif query.data == 'cancel_clear':
-        await query.edit_message_text("❌ *Cancelado*", parse_mode='Markdown')
+        if chat_id not in shopping_lists:
+            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+        
+        items = shopping_lists[chat_id]['items']
+        menu_text = get_main_menu_text(items)
+        
+        await query.edit_message_text(
+            menu_text,
+            parse_mode='Markdown',
+            reply_markup=get_main_menu_keyboard()
+        )
 
 
 def main() -> None:
@@ -420,14 +509,10 @@ def main() -> None:
     bot_token = os.getenv('BOT_TOKEN')
     
     if not bot_token:
-        logger.error("❌ ERRO: Variável 'BOT_TOKEN' não encontrada!")
+        logger.error("❌ ERRO: BOT_TOKEN não encontrado!")
         return
     
-    if bot_token == "YOUR_BOT_TOKEN":
-        logger.error("❌ ERRO: Use seu token real do BotFather")
-        return
-    
-    logger.info(f"✅ Token detectado: {bot_token[:20]}...")
+    logger.info(f"✅ Token: {bot_token[:20]}...")
     
     application = Application.builder().token(bot_token).build()
     
