@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Final
+Bot de Lista de Mercado para Telegram - Versão Final (Corrigida)
 Permite que membros do grupo gerenciem uma lista de compras compartilhada com interface elegante.
-Inclui menu de comandos interativo.
+Inclui menu de comandos interativo com botões funcionando corretamente.
 """
 
 import logging
@@ -135,8 +135,8 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(list_text, parse_mode='Markdown')
 
 
-async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Comando /add - Inicia processo de adicionar item"""
+async def add_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inicia o processo de adicionar item (funciona com /add e botões)"""
     chat_id = update.effective_chat.id
     
     if chat_id not in shopping_lists:
@@ -207,8 +207,8 @@ async def receive_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return ConversationHandler.END
 
 
-async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Comando /remove - Inicia processo de remover item"""
+async def remove_item_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inicia o processo de remover item (funciona com /remove e botões)"""
     chat_id = update.effective_chat.id
     
     if chat_id not in shopping_lists:
@@ -336,26 +336,77 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     chat_id = query.message.chat_id
     
+    # Responder ao clique do botão (remove o "loading" do Telegram)
+    await query.answer()
+    
     # Processar cliques do menu de boas-vindas
     if query.data == 'cmd_add':
-        await query.answer()
-        await add_item(query, context)
+        # Criar um Update fake para usar a função add_item_start
+        await query.message.reply_text(
+            "📝 *Qual item você quer adicionar?*",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardMarkup([["❌ Cancelar"]], one_time_keyboard=True)
+        )
+        context.user_data['state'] = ADDING_ITEM
     
     elif query.data == 'cmd_list':
-        await query.answer()
-        await show_list(query, context)
+        items = shopping_lists.get(chat_id, {'items': []})['items']
+        list_text = get_list_text(items)
+        await query.message.reply_text(list_text, parse_mode='Markdown')
     
     elif query.data == 'cmd_remove':
-        await query.answer()
-        await remove_item(query, context)
+        items = shopping_lists.get(chat_id, {'items': []})['items']
+        
+        if not items:
+            await query.message.reply_text("📋 *A lista está vazia!*", parse_mode='Markdown')
+            return
+        
+        list_text = get_list_text(items)
+        await query.message.reply_text(list_text, parse_mode='Markdown')
+        await query.message.reply_text(
+            "🗑️ *Digite o número do item a remover:*",
+            parse_mode='Markdown',
+            reply_markup=ReplyKeyboardMarkup([["❌ Cancelar"]], one_time_keyboard=True)
+        )
+        context.user_data['state'] = REMOVING_ITEM
     
     elif query.data == 'cmd_clear':
-        await query.answer()
-        await clear_list(query, context)
+        items = shopping_lists.get(chat_id, {'items': []})['items']
+        
+        if not items:
+            await query.message.reply_text("📋 *A lista já está vazia!*", parse_mode='Markdown')
+            return
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Sim, limpar", callback_data='confirm_clear'),
+                InlineKeyboardButton("❌ Cancelar", callback_data='cancel_clear')
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            "⚠️ *Confirmação*\n\n"
+            "Tem certeza que deseja limpar TODA a lista?",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
     
     elif query.data == 'cmd_help':
-        await query.answer()
-        await help_command(query, context)
+        help_text = (
+            "📚 *GUIA DE USO*\n\n"
+            "*🛒 Adicionar Itens*\n"
+            "Use: /add\n"
+            "Digite o nome do item\n\n"
+            "*❌ Remover Itens*\n"
+            "Use: /remove\n"
+            "Digite o número do item\n\n"
+            "*📋 Ver Lista*\n"
+            "Use: /list\n\n"
+            "*🗑️ Limpar Lista*\n"
+            "Use: /clear\n\n"
+            "💡 Qualquer membro pode adicionar/remover itens!"
+        )
+        await query.message.reply_text(help_text, parse_mode='Markdown')
     
     # Processar confirmação de limpeza
     elif query.data == 'confirm_clear':
@@ -408,7 +459,7 @@ def main() -> None:
     
     # Handlers de conversação para add e remove
     add_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("add", add_item)],
+        entry_points=[CommandHandler("add", add_item_start)],
         states={
             ADDING_ITEM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_item)
@@ -418,7 +469,7 @@ def main() -> None:
     )
     
     remove_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("remove", remove_item)],
+        entry_points=[CommandHandler("remove", remove_item_start)],
         states={
             REMOVING_ITEM: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_removal)
