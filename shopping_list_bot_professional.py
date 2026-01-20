@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Profissional
+Bot de Lista de Mercado para Telegram - Versão Profissional (Corrigida)
 Permite que membros do grupo gerenciem uma lista de compras compartilhada com interface elegante.
 """
 
@@ -40,16 +40,15 @@ def get_list_text(items: list, show_count: bool = True) -> str:
         return "📋 *Lista de Compras Vazia*\n\n_Comece adicionando itens com /add_"
     
     text = "📋 *LISTA DE COMPRAS*\n"
-    text += "━" * 40 + "\n\n"
+    text += "━" * 30 + "\n\n"
     
     for i, item in enumerate(items, 1):
-        text += f"  {i}. ✓ {item}\n"
+        text += f"{i}. ✓ {item}\n"
     
-    text += "\n" + "━" * 40
+    text += "\n" + "━" * 30
     
     if show_count:
         text += f"\n\n📊 *Total:* {len(items)} item(ns)"
-        text += f"\n⏰ *Atualizado em:* {datetime.now().strftime('%H:%M')}"
     
     return text
 
@@ -58,46 +57,32 @@ def get_welcome_message() -> str:
     """Retorna mensagem de boas-vindas formatada profissionalmente"""
     return (
         "👋 *Bem-vindo ao Bot de Lista de Mercado!*\n\n"
-        "Este bot ajuda sua família a gerenciar uma lista de compras compartilhada de forma simples e eficiente.\n\n"
-        "━" * 40 + "\n"
-        "*📌 COMANDOS DISPONÍVEIS:*\n\n"
-        "🛒 */add* - Adicionar item à lista\n"
-        "❌ */remove* - Remover item da lista\n"
-        "📋 */list* - Ver lista completa\n"
-        "🗑️ */clear* - Limpar toda a lista\n"
-        "❓ */help* - Ver ajuda detalhada\n"
-        "ℹ️ */info* - Informações sobre o bot\n\n"
-        "━" * 40 + "\n"
-        "💡 *Dica:* Use /add para começar!"
+        "Este bot ajuda sua família a gerenciar uma lista de compras de forma simples.\n\n"
+        "*Comandos Disponíveis:*\n"
+        "🛒 /add - Adicionar item\n"
+        "❌ /remove - Remover item\n"
+        "📋 /list - Ver lista\n"
+        "🗑️ /clear - Limpar lista\n"
+        "❓ /help - Ajuda\n\n"
+        "💡 Use /add para começar!"
     )
 
 
 def get_help_message() -> str:
     """Retorna mensagem de ajuda detalhada"""
     return (
-        "📚 *GUIA DE USO - Bot de Lista de Mercado*\n\n"
-        "━" * 40 + "\n\n"
-        "*🛒 Adicionando Itens*\n"
+        "📚 *GUIA DE USO*\n\n"
+        "*🛒 Adicionar Itens*\n"
         "Digite: /add\n"
-        "O bot pedirá o nome do item\n"
-        "Exemplo: Leite, Pão, Ovos\n\n"
-        "*❌ Removendo Itens*\n"
+        "Digite o nome do item\n\n"
+        "*❌ Remover Itens*\n"
         "Digite: /remove\n"
-        "O bot mostrará a lista com números\n"
-        "Digite o número do item a remover\n\n"
-        "*📋 Visualizando a Lista*\n"
-        "Digite: /list\n"
-        "Mostra todos os itens com números\n\n"
-        "*🗑️ Limpando a Lista*\n"
-        "Digite: /clear\n"
-        "Remove TODOS os itens (cuidado!)\n\n"
-        "━" * 40 + "\n\n"
-        "*💡 Dicas Úteis:*\n"
-        "• Qualquer membro pode adicionar/remover itens\n"
-        "• A lista é compartilhada com todos\n"
-        "• Use /list para ver o estado atual\n"
-        "• Não há limite de itens\n"
-        "• Os itens não podem ser duplicados\n"
+        "Digite o número do item\n\n"
+        "*📋 Ver Lista*\n"
+        "Digite: /list\n\n"
+        "*🗑️ Limpar Lista*\n"
+        "Digite: /clear\n\n"
+        "💡 Qualquer membro pode adicionar/remover itens!"
     )
 
 
@@ -105,18 +90,14 @@ def get_info_message() -> str:
     """Retorna informações sobre o bot"""
     return (
         "ℹ️ *INFORMAÇÕES DO BOT*\n\n"
-        "━" * 40 + "\n\n"
-        "*Versão:* 2.0 Professional\n"
+        "*Versão:* 2.1 Professional\n"
         "*Função:* Gerenciador de Lista de Compras\n"
         "*Desenvolvido por:* Manus AI\n\n"
         "*Recursos:*\n"
-        "✅ Interface profissional e intuitiva\n"
+        "✅ Interface profissional\n"
         "✅ Suporte a múltiplos grupos\n"
         "✅ Sem limite de itens\n"
-        "✅ Validação de duplicatas\n"
-        "✅ Formatação elegante\n\n"
-        "━" * 40 + "\n\n"
-        "*Dúvidas?* Use /help para mais informações"
+        "✅ Validação de duplicatas"
     )
 
 
@@ -180,8 +161,7 @@ async def add_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
     
     await update.message.reply_text(
-        "📝 *Qual item você quer adicionar?*\n\n"
-        "_Digite o nome do item ou clique em Cancelar_",
+        "📝 *Qual item você quer adicionar?*",
         parse_mode='Markdown',
         reply_markup=markup
     )
@@ -204,7 +184,7 @@ async def receive_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     if not item_name or len(item_name) < 2:
         await update.message.reply_text(
-            "❌ *Erro:* O nome do item deve ter pelo menos 2 caracteres",
+            "❌ *Erro:* Nome muito curto (mínimo 2 caracteres)",
             parse_mode='Markdown'
         )
         return ADDING_ITEM
@@ -227,10 +207,13 @@ async def receive_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     list_text = get_list_text(items)
     
     await update.message.reply_text(
-        f"✅ *Sucesso!*\n\n'{item_name}' foi adicionado à lista!\n\n{list_text}",
+        f"✅ *Sucesso!*\n\n'{item_name}' foi adicionado!",
         parse_mode='Markdown',
         reply_markup=ReplyKeyboardRemove()
     )
+    
+    # Enviar a lista em uma mensagem separada
+    await update.message.reply_text(list_text, parse_mode='Markdown')
     
     return ConversationHandler.END
 
@@ -250,7 +233,7 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     
     if not items:
         await update.message.reply_text(
-            "📋 *A lista está vazia!*\n\n_Não há nada para remover_",
+            "📋 *A lista está vazia!*",
             parse_mode='Markdown'
         )
         return ConversationHandler.END
@@ -260,9 +243,12 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
     
     await update.message.reply_text(
-        f"{list_text}\n\n"
-        "🗑️ *Digite o número do item que deseja remover:*\n"
-        "_(ou clique em Cancelar)_",
+        list_text,
+        parse_mode='Markdown'
+    )
+    
+    await update.message.reply_text(
+        "🗑️ *Digite o número do item a remover:*",
         parse_mode='Markdown',
         reply_markup=markup
     )
@@ -290,8 +276,7 @@ async def receive_removal(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         if index < 0 or index >= len(items):
             await update.message.reply_text(
-                f"❌ *Erro:* Número inválido!\n\n"
-                f"_Use um número de 1 a {len(items)}_",
+                f"❌ *Erro:* Número inválido! (1 a {len(items)})",
                 parse_mode='Markdown',
                 reply_markup=ReplyKeyboardRemove()
             )
@@ -301,11 +286,15 @@ async def receive_removal(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         shopping_lists[chat_id]['updated_at'] = datetime.now()
         
         list_text = get_list_text(items)
+        
         await update.message.reply_text(
-            f"✅ *Sucesso!*\n\n'{removed_item}' foi removido da lista!\n\n{list_text}",
+            f"✅ *Sucesso!*\n\n'{removed_item}' foi removido!",
             parse_mode='Markdown',
             reply_markup=ReplyKeyboardRemove()
         )
+        
+        # Enviar a lista em uma mensagem separada
+        await update.message.reply_text(list_text, parse_mode='Markdown')
         
     except ValueError:
         await update.message.reply_text(
@@ -347,8 +336,7 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     
     await update.message.reply_text(
         "⚠️ *Confirmação*\n\n"
-        "Você tem certeza que deseja limpar TODA a lista?\n"
-        "_Esta ação não pode ser desfeita!_",
+        "Tem certeza que deseja limpar TODA a lista?",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
@@ -364,8 +352,7 @@ async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         shopping_lists[chat_id]['updated_at'] = datetime.now()
         
         await query.edit_message_text(
-            "🗑️ *Lista limpa com sucesso!*\n\n"
-            "_Use /add para adicionar novos itens_",
+            "🗑️ *Lista limpa com sucesso!*",
             parse_mode='Markdown'
         )
     else:
