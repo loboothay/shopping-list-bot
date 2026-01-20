@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Profissional (Corrigida)
+Bot de Lista de Mercado para Telegram - Versão Final
 Permite que membros do grupo gerenciem uma lista de compras compartilhada com interface elegante.
+Inclui menu de comandos interativo.
 """
 
 import logging
 import os
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,7 +29,6 @@ logger = logging.getLogger(__name__)
 # Estados da conversa
 ADDING_ITEM = 1
 REMOVING_ITEM = 2
-EDITING_ITEM = 3
 
 # Dicionário para armazenar listas por grupo com metadados
 shopping_lists = {}
@@ -53,52 +53,18 @@ def get_list_text(items: list, show_count: bool = True) -> str:
     return text
 
 
-def get_welcome_message() -> str:
-    """Retorna mensagem de boas-vindas formatada profissionalmente"""
-    return (
-        "👋 *Bem-vindo ao Bot de Lista de Mercado!*\n\n"
-        "Este bot ajuda sua família a gerenciar uma lista de compras de forma simples.\n\n"
-        "*Comandos Disponíveis:*\n"
-        "🛒 /add - Adicionar item\n"
-        "❌ /remove - Remover item\n"
-        "📋 /list - Ver lista\n"
-        "🗑️ /clear - Limpar lista\n"
-        "❓ /help - Ajuda\n\n"
-        "💡 Use /add para começar!"
-    )
-
-
-def get_help_message() -> str:
-    """Retorna mensagem de ajuda detalhada"""
-    return (
-        "📚 *GUIA DE USO*\n\n"
-        "*🛒 Adicionar Itens*\n"
-        "Digite: /add\n"
-        "Digite o nome do item\n\n"
-        "*❌ Remover Itens*\n"
-        "Digite: /remove\n"
-        "Digite o número do item\n\n"
-        "*📋 Ver Lista*\n"
-        "Digite: /list\n\n"
-        "*🗑️ Limpar Lista*\n"
-        "Digite: /clear\n\n"
-        "💡 Qualquer membro pode adicionar/remover itens!"
-    )
-
-
-def get_info_message() -> str:
-    """Retorna informações sobre o bot"""
-    return (
-        "ℹ️ *INFORMAÇÕES DO BOT*\n\n"
-        "*Versão:* 2.1 Professional\n"
-        "*Função:* Gerenciador de Lista de Compras\n"
-        "*Desenvolvido por:* Manus AI\n\n"
-        "*Recursos:*\n"
-        "✅ Interface profissional\n"
-        "✅ Suporte a múltiplos grupos\n"
-        "✅ Sem limite de itens\n"
-        "✅ Validação de duplicatas"
-    )
+async def set_bot_commands(application: Application) -> None:
+    """Define os comandos do bot que aparecem no menu /"""
+    commands = [
+        BotCommand("start", "Iniciar o bot"),
+        BotCommand("add", "Adicionar item à lista"),
+        BotCommand("list", "Ver lista de compras"),
+        BotCommand("remove", "Remover item da lista"),
+        BotCommand("clear", "Limpar toda a lista"),
+        BotCommand("help", "Ver ajuda"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("✅ Menu de comandos configurado!")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -113,20 +79,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             'updated_at': datetime.now()
         }
     
-    welcome_text = get_welcome_message()
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    # Mensagem de boas-vindas com botões
+    welcome_text = (
+        "👋 *Bem-vindo ao Bot de Lista de Mercado!*\n\n"
+        "Gerenciador de compras compartilhado para sua família.\n\n"
+        "Toque em um comando abaixo para começar:"
+    )
+    
+    # Criar botões com os comandos principais
+    keyboard = [
+        [InlineKeyboardButton("🛒 Adicionar Item", callback_data='cmd_add')],
+        [InlineKeyboardButton("📋 Ver Lista", callback_data='cmd_list')],
+        [InlineKeyboardButton("❌ Remover Item", callback_data='cmd_remove')],
+        [InlineKeyboardButton("🗑️ Limpar Lista", callback_data='cmd_clear')],
+        [InlineKeyboardButton("❓ Ajuda", callback_data='cmd_help')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Comando /help - Mostra ajuda detalhada"""
-    help_text = get_help_message()
+    help_text = (
+        "📚 *GUIA DE USO*\n\n"
+        "*🛒 Adicionar Itens*\n"
+        "Use: /add\n"
+        "Digite o nome do item\n\n"
+        "*❌ Remover Itens*\n"
+        "Use: /remove\n"
+        "Digite o número do item\n\n"
+        "*📋 Ver Lista*\n"
+        "Use: /list\n\n"
+        "*🗑️ Limpar Lista*\n"
+        "Use: /clear\n\n"
+        "💡 Qualquer membro pode adicionar/remover itens!"
+    )
     await update.message.reply_text(help_text, parse_mode='Markdown')
-
-
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando /info - Mostra informações do bot"""
-    info_text = get_info_message()
-    await update.message.reply_text(info_text, parse_mode='Markdown')
 
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -342,12 +331,34 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback para confirmação de limpeza"""
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processa cliques nos botões do menu"""
     query = update.callback_query
     chat_id = query.message.chat_id
     
-    if query.data == 'confirm_clear':
+    # Processar cliques do menu de boas-vindas
+    if query.data == 'cmd_add':
+        await query.answer()
+        await add_item(query, context)
+    
+    elif query.data == 'cmd_list':
+        await query.answer()
+        await show_list(query, context)
+    
+    elif query.data == 'cmd_remove':
+        await query.answer()
+        await remove_item(query, context)
+    
+    elif query.data == 'cmd_clear':
+        await query.answer()
+        await clear_list(query, context)
+    
+    elif query.data == 'cmd_help':
+        await query.answer()
+        await help_command(query, context)
+    
+    # Processar confirmação de limpeza
+    elif query.data == 'confirm_clear':
         shopping_lists[chat_id]['items'] = []
         shopping_lists[chat_id]['updated_at'] = datetime.now()
         
@@ -355,7 +366,8 @@ async def clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "🗑️ *Lista limpa com sucesso!*",
             parse_mode='Markdown'
         )
-    else:
+    
+    elif query.data == 'cancel_clear':
         await query.edit_message_text(
             "❌ *Operação cancelada*",
             parse_mode='Markdown'
@@ -418,12 +430,14 @@ def main() -> None:
     # Registrar handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("list", show_list))
     application.add_handler(CommandHandler("clear", clear_list))
-    application.add_handler(CallbackQueryHandler(clear_callback))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(add_conv_handler)
     application.add_handler(remove_conv_handler)
+    
+    # Configurar comandos do bot
+    application.post_init = set_bot_commands
     
     # Iniciar o bot
     logger.info("🤖 Bot iniciado! Pressione Ctrl+C para parar.")
