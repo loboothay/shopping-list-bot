@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Estável
-Permite que membros do grupo gerenciem uma lista de compras compartilhada.
-Versão simplificada e confiável com comandos tradicionais.
+Bot de Lista de Mercado para Telegram - Versão Bonita e Funcional
+Interface elegante com botões + comandos que funcionam perfeitamente.
 """
 
 import logging
 import os
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, BotCommand
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +15,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
+    CallbackQueryHandler,
 )
 
 # Configurar logging
@@ -39,15 +39,33 @@ def get_list_text(items: list) -> str:
         return "📋 *Lista de Compras Vazia*\n\n_Use /add para começar!_"
     
     text = "📋 *LISTA DE COMPRAS*\n"
-    text += "━" * 30 + "\n\n"
+    text += "━" * 25 + "\n\n"
     
     for i, item in enumerate(items, 1):
         text += f"{i}. ✓ {item}\n"
     
-    text += "\n" + "━" * 30
+    text += "\n" + "━" * 25
     text += f"\n\n📊 *Total:* {len(items)} item(ns)"
     
     return text
+
+
+def get_main_menu_keyboard():
+    """Retorna o teclado do menu principal"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🛒 Adicionar", callback_data='info_add'),
+            InlineKeyboardButton("📋 Ver Lista", callback_data='action_list')
+        ],
+        [
+            InlineKeyboardButton("❌ Remover", callback_data='info_remove'),
+            InlineKeyboardButton("🗑️ Limpar", callback_data='action_clear')
+        ],
+        [
+            InlineKeyboardButton("❓ Ajuda", callback_data='action_help')
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -74,16 +92,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_text = (
         "👋 *Bem-vindo ao Bot de Lista de Mercado!*\n\n"
         "Gerenciador de compras para sua família.\n\n"
-        "*Comandos Disponíveis:*\n"
-        "🛒 /add - Adicionar item\n"
-        "📋 /list - Ver lista\n"
-        "❌ /remove - Remover item\n"
-        "🗑️ /clear - Limpar lista\n"
-        "❓ /help - Ajuda\n\n"
-        "💡 Comece com /add!"
+        "Escolha uma opção abaixo:"
     )
     
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(
+        welcome_text, 
+        parse_mode='Markdown',
+        reply_markup=get_main_menu_keyboard()
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -100,7 +116,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Use: /list\n\n"
         "*🗑️ Limpar Lista*\n"
         "Use: /clear\n\n"
-        "💡 Qualquer membro pode adicionar/remover!"
+        "💡 Qualquer membro pode usar!"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
@@ -275,39 +291,103 @@ async def clear_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     
-    # Pedir confirmação
-    reply_keyboard = [["✅ Sim, limpar", "❌ Cancelar"]]
-    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
+    # Botões de confirmação
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Sim, limpar", callback_data='confirm_clear'),
+            InlineKeyboardButton("❌ Cancelar", callback_data='cancel_clear')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "⚠️ *Tem certeza que quer limpar TODA a lista?*",
         parse_mode='Markdown',
-        reply_markup=markup
+        reply_markup=reply_markup
     )
-    
-    context.user_data['waiting_clear_confirmation'] = True
 
 
-async def handle_clear_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Processa confirmação de limpeza"""
-    chat_id = update.effective_chat.id
-    response = update.message.text.strip()
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processa cliques nos botões"""
+    query = update.callback_query
+    chat_id = query.message.chat_id
     
-    if response == "✅ Sim, limpar":
+    await query.answer()
+    
+    # Botões informativos (mostram como usar o comando)
+    if query.data == 'info_add':
+        await query.message.reply_text(
+            "🛒 *Para adicionar um item:*\n\nDigite /add e depois o nome do item.",
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == 'info_remove':
+        await query.message.reply_text(
+            "❌ *Para remover um item:*\n\nDigite /remove e depois o número do item.",
+            parse_mode='Markdown'
+        )
+    
+    # Botões de ação (executam diretamente)
+    elif query.data == 'action_list':
+        if chat_id not in shopping_lists:
+            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+        
+        items = shopping_lists[chat_id]['items']
+        list_text = get_list_text(items)
+        await query.message.reply_text(list_text, parse_mode='Markdown')
+    
+    elif query.data == 'action_clear':
+        if chat_id not in shopping_lists:
+            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+        
+        if not shopping_lists[chat_id]['items']:
+            await query.message.reply_text(
+                "📋 *A lista já está vazia!*",
+                parse_mode='Markdown'
+            )
+            return
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Sim, limpar", callback_data='confirm_clear'),
+                InlineKeyboardButton("❌ Cancelar", callback_data='cancel_clear')
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.message.reply_text(
+            "⚠️ *Tem certeza que quer limpar TODA a lista?*",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    
+    elif query.data == 'action_help':
+        help_text = (
+            "📚 *GUIA DE USO*\n\n"
+            "*🛒 Adicionar:* /add\n"
+            "*📋 Ver Lista:* /list\n"
+            "*❌ Remover:* /remove\n"
+            "*🗑️ Limpar:* /clear\n\n"
+            "💡 Qualquer membro pode usar!"
+        )
+        await query.message.reply_text(help_text, parse_mode='Markdown')
+    
+    # Confirmação de limpeza
+    elif query.data == 'confirm_clear':
+        if chat_id not in shopping_lists:
+            shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
+        
         shopping_lists[chat_id]['items'] = []
-        await update.message.reply_text(
+        await query.edit_message_text(
             "🗑️ *Lista limpa com sucesso!*",
-            parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove()
-        )
-    else:
-        await update.message.reply_text(
-            "❌ *Cancelado*",
-            parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove()
+            parse_mode='Markdown'
         )
     
-    context.user_data['waiting_clear_confirmation'] = False
+    elif query.data == 'cancel_clear':
+        await query.edit_message_text(
+            "❌ *Cancelado*",
+            parse_mode='Markdown'
+        )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -358,14 +438,9 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("list", show_list))
     application.add_handler(CommandHandler("clear", clear_list))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(add_conv)
     application.add_handler(remove_conv)
-    
-    # Handler para confirmação de limpeza
-    application.add_handler(MessageHandler(
-        filters.TEXT & filters.Regex(r"^(✅ Sim, limpar|❌ Cancelar)$"),
-        handle_clear_confirmation
-    ))
     
     application.post_init = set_bot_commands
     
