@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bot de Lista de Mercado para Telegram - Versão Perfeita
-Interface elegante com botões que funcionam diretamente.
+Bot de Lista de Mercado para Telegram - Versão para Grupos
+Interface elegante com botões que funcionam em grupos corretamente.
 """
 
 import logging
@@ -73,6 +73,15 @@ def get_main_menu_keyboard():
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_cancel_keyboard():
+    """Retorna teclado de cancelar (seletivo para grupos)"""
+    return ReplyKeyboardMarkup(
+        [["❌ Cancelar"]], 
+        one_time_keyboard=True,
+        selective=True  # Aparece só para quem enviou o comando
+    )
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -148,6 +157,7 @@ async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Comando /add - Inicia adição de item"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
     
     if chat_id not in shopping_lists:
         shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
@@ -156,13 +166,11 @@ async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state_key = get_user_state_key(chat_id, user_id)
     user_states[state_key] = STATE_ADDING
     
-    reply_keyboard = [["❌ Cancelar"]]
-    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-    
     await update.message.reply_text(
-        "📝 *Qual item você quer adicionar?*",
+        f"📝 *{user_name}, qual item você quer adicionar?*\n\n_Digite o nome ou /cancel para cancelar_",
         parse_mode='Markdown',
-        reply_markup=markup
+        reply_markup=get_cancel_keyboard(),
+        reply_to_message_id=update.message.message_id  # Responde à mensagem original
     )
 
 
@@ -170,6 +178,7 @@ async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Comando /remove - Inicia remoção"""
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    user_name = update.effective_user.first_name
     
     if chat_id not in shopping_lists:
         shopping_lists[chat_id] = {'items': [], 'created_at': datetime.now()}
@@ -188,14 +197,13 @@ async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_states[state_key] = STATE_REMOVING
     
     list_text = get_list_text(items)
-    reply_keyboard = [["❌ Cancelar"]]
-    markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
     
     await update.message.reply_text(list_text, parse_mode='Markdown')
     await update.message.reply_text(
-        "🗑️ *Digite o número do item a remover:*",
+        f"🗑️ *{user_name}, digite o número do item a remover:*\n\n_Ou /cancel para cancelar_",
         parse_mode='Markdown',
-        reply_markup=markup
+        reply_markup=get_cancel_keyboard(),
+        reply_to_message_id=update.message.message_id
     )
 
 
@@ -240,7 +248,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         "❌ *Operação cancelada*",
         parse_mode='Markdown',
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=ReplyKeyboardRemove(selective=True)
     )
 
 
@@ -249,9 +257,14 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     text = update.message.text.strip()
+    user_name = update.effective_user.first_name
     
     state_key = get_user_state_key(chat_id, user_id)
     current_state = user_states.get(state_key, STATE_NONE)
+    
+    # Se o usuário não está em nenhum estado, ignorar a mensagem
+    if current_state == STATE_NONE:
+        return
     
     # Verificar cancelamento
     if text.lower() == "❌ cancelar" or text.lower() == "cancelar":
@@ -259,7 +272,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "❌ *Cancelado*",
             parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=ReplyKeyboardRemove(selective=True)
         )
         return
     
@@ -270,8 +283,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         if not text or len(text) < 2:
             await update.message.reply_text(
-                "❌ *Erro:* Nome muito curto (mínimo 2 caracteres)",
-                parse_mode='Markdown'
+                f"❌ *{user_name}, nome muito curto!* (mínimo 2 caracteres)",
+                parse_mode='Markdown',
+                reply_to_message_id=update.message.message_id
             )
             return
         
@@ -282,7 +296,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 f"⚠️ *'{text}' já está na lista!*",
                 parse_mode='Markdown',
-                reply_markup=ReplyKeyboardRemove()
+                reply_markup=ReplyKeyboardRemove(selective=True)
             )
             return
         
@@ -294,9 +308,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         list_text = get_list_text(items)
         
         await update.message.reply_text(
-            f"✅ *'{text}' adicionado!*",
+            f"✅ *'{text}' adicionado por {user_name}!*",
             parse_mode='Markdown',
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=ReplyKeyboardRemove(selective=True)
         )
         await update.message.reply_text(list_text, parse_mode='Markdown')
     
@@ -312,8 +326,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             if index < 0 or index >= len(items):
                 await update.message.reply_text(
-                    f"❌ *Número inválido! (1 a {len(items)})*",
-                    parse_mode='Markdown'
+                    f"❌ *{user_name}, número inválido!* (1 a {len(items)})",
+                    parse_mode='Markdown',
+                    reply_to_message_id=update.message.message_id
                 )
                 return
             
@@ -323,16 +338,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             list_text = get_list_text(items)
             
             await update.message.reply_text(
-                f"✅ *'{removed_item}' removido!*",
+                f"✅ *'{removed_item}' removido por {user_name}!*",
                 parse_mode='Markdown',
-                reply_markup=ReplyKeyboardRemove()
+                reply_markup=ReplyKeyboardRemove(selective=True)
             )
             await update.message.reply_text(list_text, parse_mode='Markdown')
             
         except ValueError:
             await update.message.reply_text(
-                "❌ *Digite apenas o número do item*",
-                parse_mode='Markdown'
+                f"❌ *{user_name}, digite apenas o número do item*",
+                parse_mode='Markdown',
+                reply_to_message_id=update.message.message_id
             )
 
 
@@ -341,6 +357,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     chat_id = query.message.chat_id
     user_id = query.from_user.id
+    user_name = query.from_user.first_name
     
     await query.answer()
     
@@ -353,13 +370,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         user_states[state_key] = STATE_ADDING
         
-        reply_keyboard = [["❌ Cancelar"]]
-        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
-        
         await query.message.reply_text(
-            "📝 *Qual item você quer adicionar?*",
+            f"📝 *{user_name}, qual item você quer adicionar?*\n\n_Digite o nome ou /cancel para cancelar_",
             parse_mode='Markdown',
-            reply_markup=markup
+            reply_markup=get_cancel_keyboard()
         )
     
     # Botão Ver Lista
@@ -388,14 +402,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_states[state_key] = STATE_REMOVING
         
         list_text = get_list_text(items)
-        reply_keyboard = [["❌ Cancelar"]]
-        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True)
         
         await query.message.reply_text(list_text, parse_mode='Markdown')
         await query.message.reply_text(
-            "🗑️ *Digite o número do item a remover:*",
+            f"🗑️ *{user_name}, digite o número do item a remover:*\n\n_Ou /cancel para cancelar_",
             parse_mode='Markdown',
-            reply_markup=markup
+            reply_markup=get_cancel_keyboard()
         )
     
     # Botão Limpar
@@ -444,7 +456,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         shopping_lists[chat_id]['items'] = []
         await query.edit_message_text(
-            "🗑️ *Lista limpa com sucesso!*",
+            f"🗑️ *Lista limpa por {user_name}!*",
             parse_mode='Markdown'
         )
     
