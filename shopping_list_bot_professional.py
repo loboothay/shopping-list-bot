@@ -159,6 +159,20 @@ def _normalize(text: str) -> str:
     return ''.join(c for c in nfkd if not unicodedata.combining(c))
 
 
+def same_item(a: str, b: str) -> bool:
+    """Mesmo item? Compara sem acento/maiúscula e tolera plural simples (+s/+es).
+
+    Conservador: só funde quando um nome é exatamente o outro + 's'/'es'. Assim,
+    'ovo'/'ovos' e 'banana'/'bananas' fundem, mas 'pão'/'pães' (irregular) e
+    'leite'/'leite condensado' (nomes distintos) NÃO fundem.
+    """
+    na, nb = _normalize(a), _normalize(b)
+    if na == nb:
+        return True
+    short, long = sorted((na, nb), key=len)
+    return long == short + 's' or long == short + 'es'
+
+
 def categorize_local(name: str) -> str | None:
     """Tenta categorizar pelo dicionário local. Retorna a categoria ou None."""
     norm = _normalize(name)
@@ -865,18 +879,19 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         items = shopping_lists[chat_id]['items']
 
         # Separa por vírgula, extrai quantidade e funde duplicados do próprio lote
-        pending = {}     # nome_normalizado -> [qty, nome_exibido]
+        # (incl. plural/singular via same_item). pending = [[qty, nome_exibido], ...]
+        pending = []
         ignored = []
         for part in [p.strip() for p in text.split(',') if p.strip()]:
             qty, name = parse_quantity(part)
             if len(name) < 2:
                 ignored.append(part)
                 continue
-            key = _normalize(name)
-            if key in pending:
-                pending[key][0] += qty
+            existing = next((p for p in pending if same_item(p[1], name)), None)
+            if existing:
+                existing[0] += qty
             else:
-                pending[key] = [qty, name]
+                pending.append([qty, name])
 
         user_states[state_key] = STATE_NONE
 
@@ -890,15 +905,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Mensagem transitória enquanto organiza (a categorização pode chamar a IA)
         organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
 
-        existing_by_key = {_normalize(it['name']): it for it in items}
-        new_names = [v[1] for k, v in pending.items() if k not in existing_by_key]
+        # Casa cada pendente com um item já existente (plural/singular incluso)
+        matches = [next((it for it in items if same_item(it['name'], name)), None) for qty, name in pending]
+        new_names = [name for (qty, name), m in zip(pending, matches) if m is None]
         categories = await categorize_items(new_names) if new_names else {}
 
         added, updated = [], []
-        for key, (qty, name) in pending.items():
-            if key in existing_by_key:
-                # Item já existe: soma a quantidade
-                item = existing_by_key[key]
+        for (qty, name), item in zip(pending, matches):
+            if item is not None:
+                # Item já existe (mesmo nome ou plural/singular): soma a quantidade
                 item['quantity'] = min(item.get('quantity', 1) + qty, 99)
                 updated.append(item_label(item))
                 register_frequency(item['name'], item.get('category', 'Outros'))
@@ -1362,7 +1377,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if 0 <= i < len(keys):
             entry = item_frequency.get(keys[i])
-            if entry and keys[i] not in {_normalize(it['name']) for it in items}:
+            if entry and not any(same_item(it['name'], entry['name']) for it in items):
                 category = entry.get('category', 'Outros')
                 items.append({'name': entry['name'], 'bought': False, 'category': category, 'quantity': 1})
                 register_frequency(entry['name'], category)

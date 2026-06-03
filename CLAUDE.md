@@ -111,6 +111,11 @@ interpreta o próximo texto digitado.
   `leite x2`, `leite 2` (1–99; sem número → 1). `item_label(item)` mostra `Nx Nome` só
   quando `quantity > 1`. **Adicionar um item que já existe SOMA a quantidade** (não
   ignora mais o duplicado).
+- **Duplicados (incl. plural/singular)**: `same_item(a, b)` decide se dois nomes são o
+  mesmo item — compara via `_normalize` (sem acento/maiúscula) e tolera plural simples
+  (um é o outro + `s`/`es`). É conservador: `ovo`/`ovos` e `banana`/`bananas` fundem, mas
+  `leite`/`leite condensado` e plurais irregulares (`pão`/`pães`, `sal`/`sais`) **não**.
+  Usado na deduplicação do `STATE_ADDING` (dentro do lote e contra a lista) e no `addfreq`.
 - **Categorização híbrida**: `categorize_items` tenta `categorize_local` (dicionário
   `CATEGORY_KEYWORDS`, normalização sem acento em `_normalize`) e só os desconhecidos vão
   numa **única** chamada `categorize_ai` (Claude API, modelo Haiku, `AsyncAnthropic`,
