@@ -4,9 +4,13 @@ Bot de Lista de Mercado para Telegram - Com Modo Mercado (HTML)
 Usa HTML para texto riscado funcionar corretamente.
 """
 
+from __future__ import annotations
+
 import logging
 import os
+import json
 import asyncio
+import unicodedata
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -38,9 +42,221 @@ user_states = {}
 messages_to_delete = {}
 menu_messages = {}
 
+# Cache de categorias já resolvidas (nome_lower -> categoria), evita reclassificar
+category_cache = {}
+
+# Categorias de supermercado, na ordem em que aparecem na lista
+CATEGORY_ORDER = [
+    'Hortifrúti',
+    'Açougue',
+    'Laticínios',
+    'Padaria',
+    'Mercearia',
+    'Congelados',
+    'Bebidas',
+    'Limpeza',
+    'Higiene',
+    'Doces',
+    'Pet',
+    'Outros',
+]
+
+CATEGORY_EMOJI = {
+    'Hortifrúti': '🥬',
+    'Açougue': '🥩',
+    'Laticínios': '🥛',
+    'Padaria': '🍞',
+    'Mercearia': '🥫',
+    'Congelados': '🧊',
+    'Bebidas': '🥤',
+    'Limpeza': '🧴',
+    'Higiene': '🧼',
+    'Doces': '🍫',
+    'Pet': '🐶',
+    'Outros': '📦',
+}
+
+# Palavras-chave por categoria (representativo, não exaustivo). "Outros" é o fallback.
+CATEGORY_KEYWORDS = {
+    'Hortifrúti': [
+        'alface', 'tomate', 'cebola', 'batata', 'cenoura', 'alho', 'banana', 'maca',
+        'maça', 'laranja', 'limao', 'mamao', 'manga', 'uva', 'abacaxi', 'melancia',
+        'morango', 'pera', 'abacate', 'brocolis', 'couve', 'espinafre', 'pepino',
+        'pimentao', 'abobrinha', 'abobora', 'mandioca', 'beterraba', 'rucula',
+        'salsinha', 'cheiro verde', 'coentro', 'gengibre', 'verdura', 'legume', 'fruta',
+    ],
+    'Açougue': [
+        'carne', 'frango', 'file', 'bife', 'picanha', 'alcatra', 'costela', 'linguica',
+        'salsicha', 'bacon', 'peixe', 'tilapia', 'salmao', 'camarao', 'porco', 'pernil',
+        'coxa', 'sobrecoxa', 'asa', 'moida', 'patinho', 'maminha', 'fraldinha', 'cupim',
+    ],
+    'Laticínios': [
+        'leite', 'queijo', 'iogurte', 'manteiga', 'requeijao', 'creme de leite', 'nata',
+        'mussarela', 'muçarela', 'parmesao', 'ricota', 'cream cheese', 'leite condensado',
+        'margarina', 'danone', 'coalhada',
+    ],
+    'Padaria': [
+        'pao', 'paes', 'paozinho', 'bisnaga', 'baguete', 'bolo', 'biscoito', 'bolacha',
+        'torrada', 'croissant', 'rosca', 'sonho', 'broa',
+    ],
+    'Mercearia': [
+        'arroz', 'feijao', 'macarrao', 'massa', 'acucar', 'sal', 'oleo', 'azeite',
+        'cafe', 'farinha', 'fuba', 'molho', 'extrato', 'milho', 'ervilha', 'atum',
+        'sardinha', 'tempero', 'vinagre', 'fermento', 'aveia', 'granola', 'cereal',
+        'achocolatado', 'leite em po', 'lentilha', 'grao de bico', 'amido', 'gelatina',
+        'ovo', 'ovos',
+    ],
+    'Congelados': [
+        'sorvete', 'pizza', 'hamburguer', 'nuggets', 'lasanha', 'congelado', 'polpa',
+        'batata frita', 'pao de queijo', 'empanado', 'gelo',
+    ],
+    'Bebidas': [
+        'refrigerante', 'coca', 'guarana', 'suco', 'agua', 'cerveja', 'vinho', 'energetico',
+        'cha', 'isotonico', 'whisky', 'vodka', 'champagne', 'refresco',
+    ],
+    'Limpeza': [
+        'detergente', 'sabao', 'amaciante', 'desinfetante', 'agua sanitaria', 'cloro',
+        'multiuso', 'limpa vidro', 'esponja', 'saco de lixo', 'alvejante', 'lustra movel',
+        'vassoura', 'rodo', 'pano', 'cera',
+    ],
+    'Higiene': [
+        'shampoo', 'condicionador', 'sabonete', 'papel higienico', 'pasta de dente',
+        'creme dental', 'escova de dente', 'desodorante', 'absorvente', 'fralda',
+        'algodao', 'cotonete', 'fio dental', 'lenço', 'lamina', 'barbear', 'hidratante',
+    ],
+    'Doces': [
+        'chocolate', 'bombom', 'bala', 'chiclete', 'pirulito', 'salgadinho', 'doce',
+        'paçoca', 'pacoca', 'brigadeiro', 'goma', 'pipoca', 'amendoim',
+    ],
+    'Pet': [
+        'racao', 'petisco', 'areia', 'sache', 'osso', 'antipulga',
+    ],
+}
+
 
 def get_user_state_key(chat_id, user_id):
     return f"{chat_id}_{user_id}"
+
+
+def _normalize(text: str) -> str:
+    """Minúsculas e sem acentos, para casar palavras-chave"""
+    text = text.lower().strip()
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def categorize_local(name: str) -> str | None:
+    """Tenta categorizar pelo dicionário local. Retorna a categoria ou None."""
+    norm = _normalize(name)
+    if norm in category_cache:
+        return category_cache[norm]
+
+    words = norm.split()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            kw_norm = _normalize(kw)
+            if ' ' in kw_norm:
+                # keyword composta (ex.: "creme de leite"): casa como substring
+                match = kw_norm in norm
+            else:
+                # keyword simples: casa palavra inteira, com plural simples (+s/+es)
+                match = any(
+                    w == kw_norm or w == kw_norm + 's' or w == kw_norm + 'es'
+                    for w in words
+                )
+            if match:
+                category_cache[norm] = category
+                return category
+    return None
+
+
+async def categorize_ai(names: list) -> dict:
+    """Classifica itens desconhecidos via Claude API, em uma única chamada (batch).
+
+    Degrada para 'Outros' se ANTHROPIC_API_KEY não estiver setada ou a chamada falhar.
+    """
+    if not names:
+        return {}
+
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        return {name: 'Outros' for name in names}
+
+    try:
+        from anthropic import AsyncAnthropic
+
+        client = AsyncAnthropic(api_key=api_key)
+        categorias = ', '.join(CATEGORY_ORDER)
+        system_prompt = (
+            "Você classifica itens de compras de supermercado em categorias. "
+            f"Categorias permitidas (use EXATAMENTE estes nomes): {categorias}. "
+            "Responda APENAS com um objeto JSON mapeando cada item recebido à sua categoria, "
+            "sem texto extra. Se não souber, use 'Outros'."
+        )
+
+        message = await client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=1024,
+            system=[
+                {
+                    'type': 'text',
+                    'text': system_prompt,
+                    'cache_control': {'type': 'ephemeral'},
+                }
+            ],
+            messages=[
+                {
+                    'role': 'user',
+                    'content': 'Classifique estes itens: ' + json.dumps(names, ensure_ascii=False),
+                }
+            ],
+        )
+
+        raw = message.content[0].text.strip()
+        # Remove cercas de código se vierem
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        parsed = json.loads(raw)
+        result = {}
+        for name in names:
+            category = parsed.get(name, 'Outros')
+            if category not in CATEGORY_ORDER:
+                category = 'Outros'
+            result[name] = category
+            category_cache[_normalize(name)] = category
+        return result
+
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao categorizar com IA: {e}")
+        return {name: 'Outros' for name in names}
+
+
+async def categorize_items(names: list) -> dict:
+    """Categorização híbrida: dicionário local primeiro, IA só para os desconhecidos."""
+    result = {}
+    unknown = []
+    for name in names:
+        local = categorize_local(name)
+        if local:
+            result[name] = local
+        else:
+            unknown.append(name)
+
+    if unknown:
+        ai_result = await categorize_ai(unknown)
+        result.update(ai_result)
+
+    return result
+
+
+def sort_items_by_category(items: list) -> None:
+    """Ordena a lista in-place por CATEGORY_ORDER (stable: preserva ordem de inserção)."""
+    order = {cat: i for i, cat in enumerate(CATEGORY_ORDER)}
+    items.sort(key=lambda item: order.get(item.get('category', 'Outros'), len(CATEGORY_ORDER)))
 
 
 def init_list(chat_id):
@@ -50,22 +266,37 @@ def init_list(chat_id):
 
 
 def get_list_text(items: list, show_status: bool = True) -> str:
-    """Formata a lista de compras usando HTML"""
+    """Formata a lista de compras agrupada por categoria, usando HTML.
+
+    A numeração é sequencial e contínua entre os grupos. Como a lista é mantida
+    ordenada por categoria (sort_items_by_category), o número exibido coincide com
+    o índice do item na lista, o que mantém a remoção por número funcionando.
+    """
     if not items:
         return "📋 Lista vazia"
-    
-    text = ""
-    for i, item in enumerate(items, 1):
-        name = item['name']
-        bought = item.get('bought', False)
-        
-        if show_status and bought:
-            # Usa <s> para texto riscado em HTML
-            text += f"{i}. <s>{name}</s> ✅\n"
-        else:
-            text += f"{i}. {name}\n"
-    
-    return text.strip()
+
+    lines = []
+    counter = 0
+    for category in CATEGORY_ORDER:
+        group = [item for item in items if item.get('category', 'Outros') == category]
+        if not group:
+            continue
+
+        emoji = CATEGORY_EMOJI.get(category, '📦')
+        lines.append(f"\n{emoji} <b>{category}</b>")
+
+        for item in group:
+            counter += 1
+            name = item['name']
+            bought = item.get('bought', False)
+
+            if show_status and bought:
+                # Usa <s> para texto riscado em HTML
+                lines.append(f"{counter}. <s>{name}</s> ✅")
+            else:
+                lines.append(f"{counter}. {name}")
+
+    return "\n".join(lines).strip()
 
 
 def get_main_menu_text(items: list) -> str:
@@ -266,7 +497,7 @@ async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=menu_messages[chat_id],
-                text=f"📝 <b>{user_name}</b>, digite o item a adicionar:",
+                text=f"📝 <b>{user_name}</b>, digite o(s) item(ns) — separe vários por vírgula:",
                 parse_mode='HTML',
                 reply_markup=get_cancel_keyboard()
             )
@@ -276,7 +507,7 @@ async def add_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"📝 <b>{user_name}</b>, digite o item a adicionar:",
+        text=f"📝 <b>{user_name}</b>, digite o(s) item(ns) — separe vários por vírgula:",
         parse_mode='HTML',
         reply_markup=get_cancel_keyboard()
     )
@@ -312,7 +543,7 @@ async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=menu_messages[chat_id],
-                text=f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o número:",
+                text=f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o(s) número(s) — separe vários por vírgula:",
                 parse_mode='HTML',
                 reply_markup=get_cancel_keyboard()
             )
@@ -322,7 +553,7 @@ async def remove_item_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o número:",
+        text=f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o(s) número(s) — separe vários por vírgula:",
         parse_mode='HTML',
         reply_markup=get_cancel_keyboard()
     )
@@ -445,59 +676,103 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await delete_message_safe(context, chat_id, update.message.message_id)
     
-    # ADICIONANDO
+    # ADICIONANDO (um ou vários itens separados por vírgula)
     if current_state == STATE_ADDING:
         init_list(chat_id)
-        
-        if len(text) < 2:
-            msg = await context.bot.send_message(chat_id=chat_id, text="❌ <b>Muito curto!</b>", parse_mode='HTML')
-            await asyncio.sleep(1.5)
-            await delete_message_safe(context, chat_id, msg.message_id)
-            return
-        
+
+        # Separa por vírgula e limpa
+        parts = [p.strip() for p in text.split(',') if p.strip()]
+
         items_names = [item['name'].lower() for item in shopping_lists[chat_id]['items']]
-        if text.lower() in items_names:
-            user_states[state_key] = STATE_NONE
-            msg = await context.bot.send_message(chat_id=chat_id, text=f"⚠️ <b>'{text}' já existe!</b>", parse_mode='HTML')
+        to_add = []      # nomes válidos e novos
+        ignored = []     # nomes ignorados (curtos ou duplicados)
+
+        for part in parts:
+            if len(part) < 2:
+                ignored.append(part)
+                continue
+            lower = part.lower()
+            if lower in items_names or lower in [n.lower() for n in to_add]:
+                ignored.append(part)
+                continue
+            to_add.append(part)
+
+        user_states[state_key] = STATE_NONE
+
+        if not to_add:
+            msg = await context.bot.send_message(chat_id=chat_id, text="⚠️ <b>Nada novo para adicionar.</b>", parse_mode='HTML')
             await asyncio.sleep(1.5)
             await delete_message_safe(context, chat_id, msg.message_id)
             await update_menu(context, chat_id)
             return
-        
-        shopping_lists[chat_id]['items'].append({'name': text, 'bought': False})
-        user_states[state_key] = STATE_NONE
-        
-        msg = await context.bot.send_message(chat_id=chat_id, text=f"✅ <b>+{text}</b>", parse_mode='HTML')
-        await asyncio.sleep(1)
+
+        # Mensagem transitória enquanto organiza (a categorização pode chamar a IA)
+        organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
+
+        categories = await categorize_items(to_add)
+
+        for name in to_add:
+            shopping_lists[chat_id]['items'].append({
+                'name': name,
+                'bought': False,
+                'category': categories.get(name, 'Outros'),
+            })
+        sort_items_by_category(shopping_lists[chat_id]['items'])
+
+        await delete_message_safe(context, chat_id, organizing.message_id)
+
+        resumo = ", ".join(f"+{n}" for n in to_add)
+        texto = f"✅ <b>{resumo}</b>"
+        if ignored:
+            texto += f"\n⚠️ Ignorado(s): {', '.join(ignored)}"
+        msg = await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode='HTML')
+        await asyncio.sleep(1.2)
         await delete_message_safe(context, chat_id, msg.message_id)
         await update_menu(context, chat_id)
     
-    # REMOVENDO
+    # REMOVENDO (um ou vários números separados por vírgula)
     elif current_state == STATE_REMOVING:
         init_list(chat_id)
         items = shopping_lists[chat_id]['items']
-        
-        try:
-            index = int(text) - 1
-            
-            if index < 0 or index >= len(items):
-                msg = await context.bot.send_message(chat_id=chat_id, text=f"❌ <b>1 a {len(items)}!</b>", parse_mode='HTML')
-                await asyncio.sleep(1.5)
-                await delete_message_safe(context, chat_id, msg.message_id)
-                return
-            
-            removed_item = items.pop(index)
-            user_states[state_key] = STATE_NONE
-            
-            msg = await context.bot.send_message(chat_id=chat_id, text=f"✅ <b>-{removed_item['name']}</b>", parse_mode='HTML')
-            await asyncio.sleep(1)
+
+        parts = [p.strip() for p in text.split(',') if p.strip()]
+
+        indices = set()      # índices válidos (0-based)
+        invalid = []         # entradas inválidas (não número ou fora do intervalo)
+
+        for part in parts:
+            try:
+                num = int(part)
+            except ValueError:
+                invalid.append(part)
+                continue
+            if num < 1 or num > len(items):
+                invalid.append(part)
+                continue
+            indices.add(num - 1)
+
+        if not indices:
+            msg = await context.bot.send_message(chat_id=chat_id, text=f"❌ <b>Digite número(s) de 1 a {len(items)}, separados por vírgula!</b>", parse_mode='HTML')
+            await asyncio.sleep(2)
             await delete_message_safe(context, chat_id, msg.message_id)
-            await update_menu(context, chat_id)
-            
-        except ValueError:
-            msg = await context.bot.send_message(chat_id=chat_id, text="❌ <b>Digite o número!</b>", parse_mode='HTML')
-            await asyncio.sleep(1.5)
-            await delete_message_safe(context, chat_id, msg.message_id)
+            return
+
+        # Remove em ordem decrescente para não bagunçar os índices
+        removed = []
+        for index in sorted(indices, reverse=True):
+            removed.append(items.pop(index)['name'])
+        removed.reverse()
+
+        user_states[state_key] = STATE_NONE
+
+        resumo = ", ".join(f"-{n}" for n in removed)
+        texto = f"✅ <b>{resumo}</b>"
+        if invalid:
+            texto += f"\n⚠️ Inválido(s): {', '.join(invalid)}"
+        msg = await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode='HTML')
+        await asyncio.sleep(1.2)
+        await delete_message_safe(context, chat_id, msg.message_id)
+        await update_menu(context, chat_id)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -518,7 +793,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         messages_to_delete[state_key] = []
         
         await query.edit_message_text(
-            f"📝 <b>{user_name}</b>, digite o item a adicionar:",
+            f"📝 <b>{user_name}</b>, digite o(s) item(ns) — separe vários por vírgula:",
             parse_mode='HTML',
             reply_markup=get_cancel_keyboard()
         )
@@ -540,7 +815,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         list_text = get_list_text(items, show_status=False)
         await query.edit_message_text(
-            f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o número:",
+            f"📋 <b>Lista:</b>\n{list_text}\n\n🗑️ <b>{user_name}</b>, digite o(s) número(s) — separe vários por vírgula:",
             parse_mode='HTML',
             reply_markup=get_cancel_keyboard()
         )
