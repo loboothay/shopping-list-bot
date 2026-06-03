@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import json
 import asyncio
 import unicodedata
@@ -35,15 +36,28 @@ STATE_NONE = 0
 STATE_ADDING = 1
 STATE_REMOVING = 2
 STATE_MARKET_MODE = 3
+STATE_EDIT_RENAME = 4
+STATE_EDIT_QTY = 5
 
-# Armazenamento
+# Armazenamento (persistido em JSON: shopping_lists, category_cache, item_frequency)
 shopping_lists = {}
 user_states = {}
 messages_to_delete = {}
 menu_messages = {}
 
-# Cache de categorias já resolvidas (nome_lower -> categoria), evita reclassificar
+# Cache de categorias já resolvidas (nome_normalizado -> categoria), evita reclassificar
 category_cache = {}
+
+# Frequência de itens: nome_normalizado -> {'count', 'name', 'category'}
+item_frequency = {}
+
+# Estado de UI transitório (não persistido)
+edit_target = {}        # state_key -> índice do item em edição
+freq_suggestions = {}   # chat_id -> lista de nomes_normalizados sugeridos (mapeia o clique)
+
+# Persistência em arquivo (Volume do Railway montado em /data)
+DATA_DIR = os.getenv('DATA_DIR', '/data')
+DATA_FILE = os.path.join(DATA_DIR, 'shopping_data.json')
 
 # Categorias de supermercado, na ordem em que aparecem na lista
 CATEGORY_ORDER = [
@@ -259,6 +273,91 @@ def sort_items_by_category(items: list) -> None:
     items.sort(key=lambda item: order.get(item.get('category', 'Outros'), len(CATEGORY_ORDER)))
 
 
+# Captura quantidade no começo ("2x leite", "2 leite") ou no fim ("leite x2", "leite 2")
+_QTY_PREFIX = re.compile(r'^(\d{1,2})\s*x?\s+(.+)$', re.IGNORECASE)
+_QTY_SUFFIX = re.compile(r'^(.+?)\s+x?(\d{1,2})$', re.IGNORECASE)
+
+
+def parse_quantity(text: str) -> tuple:
+    """Extrai (quantidade, nome) de um texto. Sem número → quantidade 1. Limita 1–99."""
+    text = text.strip()
+    m = _QTY_PREFIX.match(text)
+    if m:
+        qty, name = int(m.group(1)), m.group(2).strip()
+    else:
+        m = _QTY_SUFFIX.match(text)
+        if m:
+            name, qty = m.group(1).strip(), int(m.group(2))
+        else:
+            return 1, text
+    qty = max(1, min(qty, 99))
+    return (qty, name) if name else (1, text)
+
+
+def register_frequency(name: str, category: str) -> None:
+    """Incrementa a frequência de um item (usado para sugerir os mais comprados)."""
+    key = _normalize(name)
+    if not key:
+        return
+    entry = item_frequency.get(key, {'count': 0, 'name': name, 'category': category})
+    entry['count'] += 1
+    entry['name'] = name
+    entry['category'] = category
+    item_frequency[key] = entry
+
+
+def save_data() -> None:
+    """Salva lista, cache de categorias e frequências em JSON (Volume do Railway)."""
+    try:
+        lists_serial = {}
+        for chat_id, data in shopping_lists.items():
+            created = data.get('created_at')
+            lists_serial[str(chat_id)] = {
+                'items': data.get('items', []),
+                'created_at': created.isoformat() if isinstance(created, datetime) else created,
+            }
+        payload = {
+            'shopping_lists': lists_serial,
+            'category_cache': category_cache,
+            'item_frequency': item_frequency,
+        }
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = DATA_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao salvar dados: {e}")
+
+
+def load_data() -> None:
+    """Carrega os dados persistidos no startup (se o arquivo existir)."""
+    try:
+        if not os.path.exists(DATA_FILE):
+            logger.info("ℹ️ Nenhum dado salvo ainda (primeira execução).")
+            return
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+
+        for chat_id_str, data in payload.get('shopping_lists', {}).items():
+            items = data.get('items', [])
+            for item in items:
+                # Migração suave de dados antigos
+                item.setdefault('quantity', 1)
+                item.setdefault('bought', False)
+                item.setdefault('category', 'Outros')
+            shopping_lists[int(chat_id_str)] = {
+                'items': items,
+                'created_at': data.get('created_at') or datetime.now().isoformat(),
+            }
+
+        category_cache.update(payload.get('category_cache', {}))
+        item_frequency.update(payload.get('item_frequency', {}))
+        logger.info(f"✅ Dados carregados: {len(shopping_lists)} lista(s).")
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao carregar dados: {e}")
+
+
 def init_list(chat_id):
     """Inicializa lista se não existir"""
     if chat_id not in shopping_lists:
@@ -287,7 +386,7 @@ def get_list_text(items: list, show_status: bool = True) -> str:
 
         for item in group:
             counter += 1
-            name = item['name']
+            name = item_label(item)
             bought = item.get('bought', False)
 
             if show_status and bought:
@@ -297,6 +396,13 @@ def get_list_text(items: list, show_status: bool = True) -> str:
                 lines.append(f"{counter}. {name}")
 
     return "\n".join(lines).strip()
+
+
+def item_label(item: dict) -> str:
+    """Nome do item para exibição, com a quantidade na frente quando > 1."""
+    name = item['name']
+    qty = item.get('quantity', 1)
+    return f"{qty}x {name}" if qty > 1 else name
 
 
 def get_main_menu_text(items: list) -> str:
@@ -315,7 +421,7 @@ def get_main_menu_text(items: list) -> str:
         return "🛒 <b>LISTA DE MERCADO</b>\n━━━━━━━━━━━━━━━\n📋 Lista vazia\n━━━━━━━━━━━━━━━"
 
 
-def get_main_menu_keyboard(has_items: bool = False):
+def get_main_menu_keyboard(has_items: bool = False, has_frequent: bool = False):
     """Teclado do menu principal"""
     keyboard = [
         [
@@ -323,16 +429,22 @@ def get_main_menu_keyboard(has_items: bool = False):
             InlineKeyboardButton("➖ Remover", callback_data='action_remove')
         ]
     ]
-    
+
     if has_items:
         keyboard.append([
+            InlineKeyboardButton("✏️ Editar", callback_data='action_edit'),
             InlineKeyboardButton("🛒 Modo Mercado", callback_data='action_market_mode')
         ])
-    
+
+    if has_frequent:
+        keyboard.append([
+            InlineKeyboardButton("⭐ Frequentes", callback_data='action_frequent')
+        ])
+
     keyboard.append([
         InlineKeyboardButton("🗑️ Limpar Tudo", callback_data='action_clear')
     ])
-    
+
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -347,14 +459,14 @@ def get_market_mode_keyboard(items: list):
     keyboard = []
     
     for i, item in enumerate(items):
-        name = item['name']
+        name = item_label(item)
         bought = item.get('bought', False)
-        
+
         if bought:
             btn_text = f"✅ {name}"
         else:
             btn_text = f"⬜ {name}"
-        
+
         keyboard.append([
             InlineKeyboardButton(btn_text, callback_data=f'toggle_{i}')
         ])
@@ -369,7 +481,78 @@ def get_market_mode_keyboard(items: list):
         keyboard.append([
             InlineKeyboardButton("🧹 Remover Comprados", callback_data='market_clear_bought')
         ])
-    
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_edit_list_keyboard(items: list):
+    """Lista de itens para escolher qual editar (um botão por item)."""
+    keyboard = [
+        [InlineKeyboardButton(item_label(item), callback_data=f'edit_{i}')]
+        for i, item in enumerate(items)
+    ]
+    keyboard.append([InlineKeyboardButton("⬅️ Voltar", callback_data='action_cancel')])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_edit_item_keyboard(index: int):
+    """Submenu de edição de um item específico."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Renomear", callback_data=f'editname_{index}'),
+            InlineKeyboardButton("🔢 Quantidade", callback_data=f'editqty_{index}'),
+        ],
+        [
+            InlineKeyboardButton("📂 Categoria", callback_data=f'editcat_{index}'),
+            InlineKeyboardButton("🗑️ Remover", callback_data=f'editdel_{index}'),
+        ],
+        [InlineKeyboardButton("⬅️ Voltar", callback_data='action_edit')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_edit_category_keyboard(index: int):
+    """Botões de categoria para reclassificar um item manualmente."""
+    keyboard = []
+    row = []
+    for cat_idx, category in enumerate(CATEGORY_ORDER):
+        emoji = CATEGORY_EMOJI.get(category, '📦')
+        row.append(InlineKeyboardButton(f"{emoji} {category}", callback_data=f'setcat_{index}_{cat_idx}'))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("⬅️ Voltar", callback_data=f'edit_{index}')])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def has_frequent_items(chat_id: int) -> bool:
+    """Há itens frequentes que ainda não estão na lista atual?"""
+    return len(build_frequent_suggestions(chat_id)) > 0
+
+
+def build_frequent_suggestions(chat_id: int, limit: int = 12) -> list:
+    """Top itens por frequência que ainda não estão na lista. Retorna lista de chaves."""
+    init_list(chat_id)
+    in_list = {_normalize(it['name']) for it in shopping_lists[chat_id]['items']}
+    ranked = sorted(item_frequency.items(), key=lambda kv: kv[1].get('count', 0), reverse=True)
+    return [key for key, _ in ranked if key not in in_list][:limit]
+
+
+def get_frequent_keyboard(chat_id: int):
+    """Teclado de sugestões de itens frequentes. Guarda o mapeamento de índices."""
+    keys = build_frequent_suggestions(chat_id)
+    freq_suggestions[chat_id] = keys
+    keyboard = []
+    for i, key in enumerate(keys):
+        entry = item_frequency.get(key, {})
+        name = entry.get('name', key)
+        count = entry.get('count', 0)
+        keyboard.append([
+            InlineKeyboardButton(f"➕ {name}  ·  {count}x", callback_data=f'addfreq_{i}')
+        ])
+    keyboard.append([InlineKeyboardButton("✔️ Pronto", callback_data='action_cancel')])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -413,7 +596,7 @@ async def update_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 message_id=menu_messages[chat_id],
                 text=menu_text,
                 parse_mode='HTML',
-                reply_markup=get_main_menu_keyboard(has_items)
+                reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
             )
             return
         except BadRequest:
@@ -423,7 +606,7 @@ async def update_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         chat_id=chat_id,
         text=menu_text,
         parse_mode='HTML',
-        reply_markup=get_main_menu_keyboard(has_items)
+        reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
     )
     menu_messages[chat_id] = msg.message_id
 
@@ -466,7 +649,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_id=chat_id,
         text=menu_text,
         parse_mode='HTML',
-        reply_markup=get_main_menu_keyboard(has_items)
+        reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
     )
     menu_messages[chat_id] = msg.message_id
 
@@ -676,31 +859,29 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await delete_message_safe(context, chat_id, update.message.message_id)
     
-    # ADICIONANDO (um ou vários itens separados por vírgula)
+    # ADICIONANDO (um ou vários itens separados por vírgula; aceita quantidade "2x leite")
     if current_state == STATE_ADDING:
         init_list(chat_id)
+        items = shopping_lists[chat_id]['items']
 
-        # Separa por vírgula e limpa
-        parts = [p.strip() for p in text.split(',') if p.strip()]
-
-        items_names = [item['name'].lower() for item in shopping_lists[chat_id]['items']]
-        to_add = []      # nomes válidos e novos
-        ignored = []     # nomes ignorados (curtos ou duplicados)
-
-        for part in parts:
-            if len(part) < 2:
+        # Separa por vírgula, extrai quantidade e funde duplicados do próprio lote
+        pending = {}     # nome_normalizado -> [qty, nome_exibido]
+        ignored = []
+        for part in [p.strip() for p in text.split(',') if p.strip()]:
+            qty, name = parse_quantity(part)
+            if len(name) < 2:
                 ignored.append(part)
                 continue
-            lower = part.lower()
-            if lower in items_names or lower in [n.lower() for n in to_add]:
-                ignored.append(part)
-                continue
-            to_add.append(part)
+            key = _normalize(name)
+            if key in pending:
+                pending[key][0] += qty
+            else:
+                pending[key] = [qty, name]
 
         user_states[state_key] = STATE_NONE
 
-        if not to_add:
-            msg = await context.bot.send_message(chat_id=chat_id, text="⚠️ <b>Nada novo para adicionar.</b>", parse_mode='HTML')
+        if not pending:
+            msg = await context.bot.send_message(chat_id=chat_id, text="⚠️ <b>Nada para adicionar.</b>", parse_mode='HTML')
             await asyncio.sleep(1.5)
             await delete_message_safe(context, chat_id, msg.message_id)
             await update_menu(context, chat_id)
@@ -709,23 +890,37 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Mensagem transitória enquanto organiza (a categorização pode chamar a IA)
         organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
 
-        categories = await categorize_items(to_add)
+        existing_by_key = {_normalize(it['name']): it for it in items}
+        new_names = [v[1] for k, v in pending.items() if k not in existing_by_key]
+        categories = await categorize_items(new_names) if new_names else {}
 
-        for name in to_add:
-            shopping_lists[chat_id]['items'].append({
-                'name': name,
-                'bought': False,
-                'category': categories.get(name, 'Outros'),
-            })
-        sort_items_by_category(shopping_lists[chat_id]['items'])
+        added, updated = [], []
+        for key, (qty, name) in pending.items():
+            if key in existing_by_key:
+                # Item já existe: soma a quantidade
+                item = existing_by_key[key]
+                item['quantity'] = min(item.get('quantity', 1) + qty, 99)
+                updated.append(item_label(item))
+                register_frequency(item['name'], item.get('category', 'Outros'))
+            else:
+                category = categories.get(name, 'Outros')
+                items.append({'name': name, 'bought': False, 'category': category, 'quantity': qty})
+                added.append(f"{qty}x {name}" if qty > 1 else name)
+                register_frequency(name, category)
+
+        sort_items_by_category(items)
+        save_data()
 
         await delete_message_safe(context, chat_id, organizing.message_id)
 
-        resumo = ", ".join(f"+{n}" for n in to_add)
-        texto = f"✅ <b>{resumo}</b>"
+        linhas = []
+        if added:
+            linhas.append("✅ " + ", ".join(f"+{n}" for n in added))
+        if updated:
+            linhas.append("🔁 " + ", ".join(updated))
         if ignored:
-            texto += f"\n⚠️ Ignorado(s): {', '.join(ignored)}"
-        msg = await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode='HTML')
+            linhas.append(f"⚠️ Ignorado(s): {', '.join(ignored)}")
+        msg = await context.bot.send_message(chat_id=chat_id, text="<b>" + "\n".join(linhas) + "</b>", parse_mode='HTML')
         await asyncio.sleep(1.2)
         await delete_message_safe(context, chat_id, msg.message_id)
         await update_menu(context, chat_id)
@@ -764,6 +959,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         removed.reverse()
 
         user_states[state_key] = STATE_NONE
+        save_data()
 
         resumo = ", ".join(f"-{n}" for n in removed)
         texto = f"✅ <b>{resumo}</b>"
@@ -772,6 +968,54 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg = await context.bot.send_message(chat_id=chat_id, text=texto, parse_mode='HTML')
         await asyncio.sleep(1.2)
         await delete_message_safe(context, chat_id, msg.message_id)
+        await update_menu(context, chat_id)
+
+    # EDITANDO: renomear item
+    elif current_state == STATE_EDIT_RENAME:
+        init_list(chat_id)
+        items = shopping_lists[chat_id]['items']
+        index = edit_target.get(state_key)
+
+        user_states[state_key] = STATE_NONE
+        edit_target.pop(state_key, None)
+
+        new_name = parse_quantity(text)[1].strip()
+        if index is None or not (0 <= index < len(items)) or len(new_name) < 2:
+            msg = await context.bot.send_message(chat_id=chat_id, text="❌ <b>Não consegui renomear.</b>", parse_mode='HTML')
+            await asyncio.sleep(1.5)
+            await delete_message_safe(context, chat_id, msg.message_id)
+            await update_menu(context, chat_id)
+            return
+
+        organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
+        category = (await categorize_items([new_name])).get(new_name, 'Outros')
+        items[index]['name'] = new_name
+        items[index]['category'] = category
+        sort_items_by_category(items)
+        save_data()
+        await delete_message_safe(context, chat_id, organizing.message_id)
+        await update_menu(context, chat_id)
+
+    # EDITANDO: nova quantidade
+    elif current_state == STATE_EDIT_QTY:
+        init_list(chat_id)
+        items = shopping_lists[chat_id]['items']
+        index = edit_target.get(state_key)
+
+        user_states[state_key] = STATE_NONE
+        edit_target.pop(state_key, None)
+
+        # Aceita "3" ou "3x" ou "x3"
+        digits = re.findall(r'\d{1,2}', text)
+        if index is None or not (0 <= index < len(items)) or not digits:
+            msg = await context.bot.send_message(chat_id=chat_id, text="❌ <b>Digite um número (ex.: 3).</b>", parse_mode='HTML')
+            await asyncio.sleep(1.5)
+            await delete_message_safe(context, chat_id, msg.message_id)
+            await update_menu(context, chat_id)
+            return
+
+        items[index]['quantity'] = max(1, min(int(digits[0]), 99))
+        save_data()
         await update_menu(context, chat_id)
 
 
@@ -806,7 +1050,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(
                 "📋 <b>Lista vazia!</b>\n\nUse ➕ Adicionar para começar.",
                 parse_mode='HTML',
-                reply_markup=get_main_menu_keyboard(False)
+                reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
             )
             return
         
@@ -828,7 +1072,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(
                 "📋 <b>Lista vazia!</b>",
                 parse_mode='HTML',
-                reply_markup=get_main_menu_keyboard(False)
+                reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
             )
             return
         
@@ -848,20 +1092,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         if 0 <= index < len(items):
             items[index]['bought'] = not items[index].get('bought', False)
-        
+            save_data()
+
         pending = sum(1 for item in items if not item.get('bought', False))
-        
+
         await query.edit_message_text(
             f"🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\nToque nos itens para marcar:\n\n📦 <b>{pending} pendente(s)</b>",
             parse_mode='HTML',
             reply_markup=get_market_mode_keyboard(items)
         )
-    
+
     # FINALIZAR MODO MERCADO
     elif query.data == 'market_finish':
         user_states[state_key] = STATE_NONE
         items = shopping_lists[chat_id]['items']
-        
+        save_data()
+
         bought_count = sum(1 for item in items if item.get('bought', False))
         
         menu_text = get_main_menu_text(items)
@@ -870,7 +1116,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             f"✅ <b>Compras finalizadas!</b>\n{bought_count} item(ns) marcado(s)\n\n{menu_text}",
             parse_mode='HTML',
-            reply_markup=get_main_menu_keyboard(has_items)
+            reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
         )
     
     # CANCELAR MODO MERCADO
@@ -880,23 +1126,25 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         items = shopping_lists[chat_id]['items']
         for item in items:
             item['bought'] = False
-        
+        save_data()
+
         menu_text = get_main_menu_text(items)
         has_items = len(items) > 0
-        
+
         await query.edit_message_text(
             menu_text,
             parse_mode='HTML',
-            reply_markup=get_main_menu_keyboard(has_items)
+            reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
         )
-    
+
     # REMOVER COMPRADOS
     elif query.data == 'market_clear_bought':
         items = shopping_lists[chat_id]['items']
-        
+
         removed_count = sum(1 for item in items if item.get('bought', False))
         shopping_lists[chat_id]['items'] = [item for item in items if not item.get('bought', False)]
-        
+        save_data()
+
         items = shopping_lists[chat_id]['items']
         
         if items:
@@ -912,7 +1160,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(
                 f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n{menu_text}",
                 parse_mode='HTML',
-                reply_markup=get_main_menu_keyboard(False)
+                reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
             )
     
     # LIMPAR TUDO
@@ -921,7 +1169,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.edit_message_text(
                 "📋 <b>Lista já está vazia!</b>",
                 parse_mode='HTML',
-                reply_markup=get_main_menu_keyboard(False)
+                reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
             )
             return
         
@@ -950,31 +1198,191 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             menu_text,
             parse_mode='HTML',
-            reply_markup=get_main_menu_keyboard(has_items)
+            reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
         )
     
     # CONFIRMAR LIMPEZA
     elif query.data == 'confirm_clear':
         shopping_lists[chat_id]['items'] = []
-        
+        save_data()
+
         menu_text = get_main_menu_text([])
         await query.edit_message_text(
             menu_text,
             parse_mode='HTML',
-            reply_markup=get_main_menu_keyboard(False)
+            reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
         )
-    
+
     # CANCELAR LIMPEZA
     elif query.data == 'cancel_clear':
         items = shopping_lists[chat_id]['items']
         menu_text = get_main_menu_text(items)
         has_items = len(items) > 0
-        
+
         await query.edit_message_text(
             menu_text,
             parse_mode='HTML',
-            reply_markup=get_main_menu_keyboard(has_items)
+            reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
         )
+
+    # ===== EDITAR =====
+    # Mostra a lista para escolher qual item editar
+    elif query.data == 'action_edit':
+        user_states[state_key] = STATE_NONE
+        edit_target.pop(state_key, None)
+        items = shopping_lists[chat_id]['items']
+
+        if not items:
+            await query.edit_message_text(
+                "📋 <b>Lista vazia!</b>",
+                parse_mode='HTML',
+                reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
+            )
+            return
+
+        await query.edit_message_text(
+            "✏️ <b>EDITAR</b>\n━━━━━━━━━━━━━━━\nEscolha o item:",
+            parse_mode='HTML',
+            reply_markup=get_edit_list_keyboard(items)
+        )
+
+    # Submenu de um item
+    elif query.data.startswith('edit_'):
+        index = int(query.data.split('_')[1])
+        items = shopping_lists[chat_id]['items']
+
+        if not (0 <= index < len(items)):
+            await query.edit_message_text(
+                "❌ <b>Item não encontrado.</b>",
+                parse_mode='HTML',
+                reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+            )
+            return
+
+        emoji = CATEGORY_EMOJI.get(items[index].get('category', 'Outros'), '📦')
+        await query.edit_message_text(
+            f"✏️ <b>{item_label(items[index])}</b>\n{emoji} {items[index].get('category', 'Outros')}\n\nO que deseja fazer?",
+            parse_mode='HTML',
+            reply_markup=get_edit_item_keyboard(index)
+        )
+
+    # Renomear: pede o novo nome
+    elif query.data.startswith('editname_'):
+        index = int(query.data.split('_')[1])
+        user_states[state_key] = STATE_EDIT_RENAME
+        edit_target[state_key] = index
+        await query.edit_message_text(
+            f"✏️ <b>{user_name}</b>, digite o novo nome:",
+            parse_mode='HTML',
+            reply_markup=get_cancel_keyboard()
+        )
+
+    # Quantidade: pede o novo número
+    elif query.data.startswith('editqty_'):
+        index = int(query.data.split('_')[1])
+        user_states[state_key] = STATE_EDIT_QTY
+        edit_target[state_key] = index
+        await query.edit_message_text(
+            f"🔢 <b>{user_name}</b>, digite a nova quantidade (ex.: 3):",
+            parse_mode='HTML',
+            reply_markup=get_cancel_keyboard()
+        )
+
+    # Categoria: mostra os botões de categoria
+    elif query.data.startswith('editcat_'):
+        index = int(query.data.split('_')[1])
+        items = shopping_lists[chat_id]['items']
+        if not (0 <= index < len(items)):
+            await query.edit_message_text(
+                "❌ <b>Item não encontrado.</b>",
+                parse_mode='HTML',
+                reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+            )
+            return
+        await query.edit_message_text(
+            f"📂 <b>{item_label(items[index])}</b>\nEscolha a categoria:",
+            parse_mode='HTML',
+            reply_markup=get_edit_category_keyboard(index)
+        )
+
+    # Define a categoria escolhida
+    elif query.data.startswith('setcat_'):
+        _, idx_str, cat_str = query.data.split('_')
+        index, cat_idx = int(idx_str), int(cat_str)
+        items = shopping_lists[chat_id]['items']
+        if 0 <= index < len(items) and 0 <= cat_idx < len(CATEGORY_ORDER):
+            new_cat = CATEGORY_ORDER[cat_idx]
+            items[index]['category'] = new_cat
+            category_cache[_normalize(items[index]['name'])] = new_cat
+            sort_items_by_category(items)
+            save_data()
+        menu_text = get_main_menu_text(items)
+        await query.edit_message_text(
+            menu_text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+        )
+
+    # Remover item pelo editor
+    elif query.data.startswith('editdel_'):
+        index = int(query.data.split('_')[1])
+        items = shopping_lists[chat_id]['items']
+        if 0 <= index < len(items):
+            items.pop(index)
+            save_data()
+        menu_text = get_main_menu_text(items)
+        await query.edit_message_text(
+            menu_text,
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+        )
+
+    # ===== FREQUENTES =====
+    elif query.data == 'action_frequent':
+        user_states[state_key] = STATE_NONE
+        if not has_frequent_items(chat_id):
+            items = shopping_lists[chat_id]['items']
+            await query.edit_message_text(
+                "⭐ <b>Sem sugestões no momento.</b>\nAdicione itens e eu passo a sugerir os mais comprados.",
+                parse_mode='HTML',
+                reply_markup=get_main_menu_keyboard(len(items) > 0, False)
+            )
+            return
+        await query.edit_message_text(
+            "⭐ <b>FREQUENTES</b>\n━━━━━━━━━━━━━━━\nToque para adicionar à lista:",
+            parse_mode='HTML',
+            reply_markup=get_frequent_keyboard(chat_id)
+        )
+
+    # Adiciona um item frequente à lista
+    elif query.data.startswith('addfreq_'):
+        i = int(query.data.split('_')[1])
+        keys = freq_suggestions.get(chat_id, [])
+        items = shopping_lists[chat_id]['items']
+
+        if 0 <= i < len(keys):
+            entry = item_frequency.get(keys[i])
+            if entry and keys[i] not in {_normalize(it['name']) for it in items}:
+                category = entry.get('category', 'Outros')
+                items.append({'name': entry['name'], 'bought': False, 'category': category, 'quantity': 1})
+                register_frequency(entry['name'], category)
+                sort_items_by_category(items)
+                save_data()
+
+        # Re-renderiza as sugestões (ou volta ao menu se acabaram)
+        if has_frequent_items(chat_id):
+            await query.edit_message_text(
+                "⭐ <b>FREQUENTES</b>\n━━━━━━━━━━━━━━━\nToque para adicionar à lista:",
+                parse_mode='HTML',
+                reply_markup=get_frequent_keyboard(chat_id)
+            )
+        else:
+            menu_text = get_main_menu_text(items)
+            await query.edit_message_text(
+                menu_text,
+                parse_mode='HTML',
+                reply_markup=get_main_menu_keyboard(len(items) > 0, False)
+            )
 
 
 def main() -> None:
@@ -986,7 +1394,9 @@ def main() -> None:
         return
     
     logger.info(f"✅ Token: {bot_token[:20]}...")
-    
+
+    load_data()
+
     application = Application.builder().token(bot_token).build()
     
     application.add_handler(CommandHandler("start", start))
