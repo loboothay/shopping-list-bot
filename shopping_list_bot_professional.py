@@ -54,6 +54,7 @@ item_frequency = {}
 # Estado de UI transitório (não persistido)
 edit_target = {}        # state_key -> índice do item em edição
 freq_suggestions = {}   # chat_id -> lista de nomes_normalizados sugeridos (mapeia o clique)
+market_hide_bought = {} # chat_id -> bool: no modo mercado, ocultar itens já comprados
 
 # Persistência em arquivo (Volume do Railway montado em /data)
 DATA_DIR = os.getenv('DATA_DIR', '/data')
@@ -468,29 +469,85 @@ def get_cancel_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_market_mode_keyboard(items: list):
-    """Teclado do modo mercado com checkboxes"""
+def get_market_header_text(items: list) -> str:
+    """Cabeçalho do modo mercado, com o total pendente/no carrinho atualizado."""
+    pending = sum(1 for item in items if not item.get('bought', False))
+    bought = sum(1 for item in items if item.get('bought', False))
+    total = len(items)
+
+    status = f"📦 <b>{pending} pendente(s)</b>"
+    if bought:
+        status += f" | ✅ {bought}/{total} no carrinho"
+
+    return (
+        "🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\n"
+        f"Toque nos itens para marcar:\n\n{status}"
+    )
+
+
+def get_market_mode_keyboard(items: list, hide_bought: bool = False):
+    """Teclado do modo mercado com checkboxes, agrupado por categoria.
+
+    Mantém a mesma organização por seção da lista (get_list_text): antes de cada
+    bloco entra um cabeçalho não-clicável (callback 'noop') com o total de itens
+    pendentes na seção. O índice usado no toggle_<i> é o índice real do item na
+    lista, preservando a marcação correta mesmo com cabeçalhos no meio.
+
+    hide_bought=True esconde os itens já comprados (e as seções que ficarem vazias),
+    para "limpar" a tela conforme as compras avançam.
+    """
     keyboard = []
-    
-    for i, item in enumerate(items):
-        name = item_label(item)
-        bought = item.get('bought', False)
 
-        if bought:
-            btn_text = f"✅ {name}"
-        else:
-            btn_text = f"⬜ {name}"
+    for category in CATEGORY_ORDER:
+        group = [(i, item) for i, item in enumerate(items)
+                 if item.get('category', 'Outros') == category]
+        if not group:
+            continue
 
+        visible = group if not hide_bought else [
+            (i, it) for i, it in group if not it.get('bought', False)
+        ]
+        if not visible:
+            continue
+
+        pending_in_group = sum(1 for _, it in group if not it.get('bought', False))
+        emoji = CATEGORY_EMOJI.get(category, '📦')
         keyboard.append([
-            InlineKeyboardButton(btn_text, callback_data=f'toggle_{i}')
+            InlineKeyboardButton(
+                f"➖ {emoji} {category} ({pending_in_group}) ➖",
+                callback_data='noop',
+            )
         ])
-    
+
+        for i, item in visible:
+            name = item_label(item)
+            bought = item.get('bought', False)
+
+            if bought:
+                btn_text = f"✅ {name}"
+            else:
+                btn_text = f"⬜ {name}"
+
+            keyboard.append([
+                InlineKeyboardButton(btn_text, callback_data=f'toggle_{i}')
+            ])
+
+    has_bought = any(item.get('bought', False) for item in items)
+    if has_bought:
+        if hide_bought:
+            keyboard.append([
+                InlineKeyboardButton("👁 Mostrar comprados", callback_data='market_toggle_hide')
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton("🙈 Ocultar comprados", callback_data='market_toggle_hide')
+            ])
+
     keyboard.append([
         InlineKeyboardButton("✔️ Finalizar", callback_data='market_finish'),
         InlineKeyboardButton("❌ Cancelar", callback_data='market_cancel')
     ])
-    
-    has_bought = any(item.get('bought', False) for item in items)
+
     if has_bought:
         keyboard.append([
             InlineKeyboardButton("🧹 Remover Comprados", callback_data='market_clear_bought')
@@ -776,27 +833,26 @@ async def market_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     state_key = get_user_state_key(chat_id, user_id)
     user_states[state_key] = STATE_MARKET_MODE
-    
-    pending = sum(1 for item in items if not item.get('bought', False))
-    
+    market_hide_bought[chat_id] = False
+
     if chat_id in menu_messages:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=menu_messages[chat_id],
-                text=f"🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\nToque nos itens para marcar:\n\n📦 <b>{pending} pendente(s)</b>",
+                text=get_market_header_text(items),
                 parse_mode='HTML',
-                reply_markup=get_market_mode_keyboard(items)
+                reply_markup=get_market_mode_keyboard(items, market_hide_bought[chat_id])
             )
             return
         except BadRequest:
             pass
-    
+
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\nToque nos itens para marcar:\n\n📦 <b>{pending} pendente(s)</b>",
+        text=get_market_header_text(items),
         parse_mode='HTML',
-        reply_markup=get_market_mode_keyboard(items)
+        reply_markup=get_market_mode_keyboard(items, market_hide_bought[chat_id])
     )
     menu_messages[chat_id] = msg.message_id
 
@@ -1045,7 +1101,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     
     state_key = get_user_state_key(chat_id, user_id)
     init_list(chat_id)
-    
+
+    # NOOP (cabeçalho de categoria no modo mercado — não faz nada)
+    if query.data == 'noop':
+        return
+
     # ADICIONAR
     if query.data == 'action_add':
         user_states[state_key] = STATE_ADDING
@@ -1092,34 +1152,50 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         
         user_states[state_key] = STATE_MARKET_MODE
-        pending = sum(1 for item in items if not item.get('bought', False))
-        
+        market_hide_bought[chat_id] = False
+
         await query.edit_message_text(
-            f"🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\nToque nos itens para marcar:\n\n📦 <b>{pending} pendente(s)</b>",
+            get_market_header_text(items),
             parse_mode='HTML',
-            reply_markup=get_market_mode_keyboard(items)
+            reply_markup=get_market_mode_keyboard(items, market_hide_bought.get(chat_id, False))
         )
-    
+
+    # OCULTAR/MOSTRAR COMPRADOS (modo mercado)
+    elif query.data == 'market_toggle_hide':
+        items = shopping_lists[chat_id]['items']
+        market_hide_bought[chat_id] = not market_hide_bought.get(chat_id, False)
+
+        try:
+            await query.edit_message_text(
+                get_market_header_text(items),
+                parse_mode='HTML',
+                reply_markup=get_market_mode_keyboard(items, market_hide_bought[chat_id])
+            )
+        except BadRequest:
+            pass
+
     # TOGGLE ITEM
     elif query.data.startswith('toggle_'):
         index = int(query.data.split('_')[1])
         items = shopping_lists[chat_id]['items']
-        
+
         if 0 <= index < len(items):
             items[index]['bought'] = not items[index].get('bought', False)
             save_data()
 
-        pending = sum(1 for item in items if not item.get('bought', False))
-
-        await query.edit_message_text(
-            f"🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\nToque nos itens para marcar:\n\n📦 <b>{pending} pendente(s)</b>",
-            parse_mode='HTML',
-            reply_markup=get_market_mode_keyboard(items)
-        )
+        try:
+            await query.edit_message_text(
+                get_market_header_text(items),
+                parse_mode='HTML',
+                reply_markup=get_market_mode_keyboard(items, market_hide_bought.get(chat_id, False))
+            )
+        except BadRequest:
+            pass
 
     # FINALIZAR MODO MERCADO
     elif query.data == 'market_finish':
         user_states[state_key] = STATE_NONE
+        market_hide_bought.pop(chat_id, None)
         items = shopping_lists[chat_id]['items']
         save_data()
 
@@ -1137,7 +1213,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # CANCELAR MODO MERCADO
     elif query.data == 'market_cancel':
         user_states[state_key] = STATE_NONE
-        
+        market_hide_bought.pop(chat_id, None)
+
         items = shopping_lists[chat_id]['items']
         for item in items:
             item['bought'] = False
@@ -1159,18 +1236,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         removed_count = sum(1 for item in items if item.get('bought', False))
         shopping_lists[chat_id]['items'] = [item for item in items if not item.get('bought', False)]
         save_data()
+        market_hide_bought[chat_id] = False
 
         items = shopping_lists[chat_id]['items']
-        
+
         if items:
-            pending = sum(1 for item in items if not item.get('bought', False))
             await query.edit_message_text(
-                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n🛒 <b>MODO MERCADO</b>\n━━━━━━━━━━━━━━━\n📦 <b>{pending} pendente(s)</b>",
+                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n{get_market_header_text(items)}",
                 parse_mode='HTML',
-                reply_markup=get_market_mode_keyboard(items)
+                reply_markup=get_market_mode_keyboard(items, market_hide_bought[chat_id])
             )
         else:
             user_states[state_key] = STATE_NONE
+            market_hide_bought.pop(chat_id, None)
             menu_text = get_main_menu_text([])
             await query.edit_message_text(
                 f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n{menu_text}",
