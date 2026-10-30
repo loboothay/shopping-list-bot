@@ -543,22 +543,52 @@ class PainelTest(StockTestCase):
         await self.register('arroz 5/1/5')
         self.find_button('Voltar ao menu')
 
-    async def test_voltar_ao_menu_mostra_a_lista_e_mantem_o_painel_fixado(self):
+    async def test_voltar_ao_menu_mostra_a_lista_e_fecha_o_painel(self):
         await self.press('Estoque')
         menu_antigo, painel = self.menu_id, self.panel_id
         await self.press('Voltar ao menu')
         self.assertIn('LISTA DE MERCADO', self.menu_text())
         self.assertIn(menu_antigo, self.api.deleted)
         self.assertNotEqual(self.menu_id, menu_antigo)
-        self.assertEqual(self.panel_id, painel)
-        self.assertIn('ESTOQUE', self.panel_text())
+        self.assertIn(painel, self.api.deleted)
+        self.assertIsNone(self.panel_id)
 
     async def test_vai_e_volta_entre_menu_e_estoque(self):
         for _ in range(3):
             await self.press('Estoque')
+            self.assertIn('ESTOQUE', self.panel_text())
             await self.press('Voltar ao menu')
         self.assertIn('LISTA DE MERCADO', self.menu_text())
-        self.assertIn('ESTOQUE', self.panel_text())
+        self.assertIsNone(self.panel_id)
+
+    async def test_painel_antigo_tambem_fecha_sem_afetar_o_atual(self):
+        await self.send('/estoque')
+        antigo = self.panel_id
+        bot.stock_panels[CHAT['id']] = 999
+        self.api.messages[999] = {'text': 'x'}
+        await self.press_data('stock_list', antigo)
+        self.assertIn(antigo, self.api.deleted)
+        self.assertEqual(self.panel_id, 999)
+
+    async def test_painel_fechado_nao_volta_depois_do_reinicio(self):
+        await self.press('Estoque')
+        await self.press('Voltar ao menu')
+        bot.stock_panels.clear()
+        bot.load_data()
+        self.assertIsNone(self.panel_id)
+
+    async def test_baixa_por_mensagem_funciona_com_o_painel_fechado(self):
+        await self.register('arroz 5/1/5')
+        await self.press('Voltar ao menu')
+        await self.send('-arroz')
+        self.assertEqual(self.stocked('arroz')['quantity'], 4)
+        self.assertIsNone(self.panel_id)
+
+    async def test_abrir_de_novo_fixa_o_painel(self):
+        await self.press('Estoque')
+        await self.press('Voltar ao menu')
+        await self.press('Estoque')
+        self.assertEqual(self.api.pinned[-1], self.panel_id)
 
     async def test_voltar_ao_menu_cancela_o_cadastro_em_andamento(self):
         await self.send('/estoque')
@@ -575,6 +605,7 @@ class PainelTest(StockTestCase):
         mercado, tela = self.menu_id, self.menu_text()
         await self.send('/estoque', user=OTHER)
         await self.press('Voltar ao menu', user=OTHER)
+        self.assertIsNone(self.panel_id)
         self.assertEqual(self.menu_id, mercado)
         self.assertEqual(self.menu_text(), tela)
         self.assertNotIn(mercado, self.api.deleted)

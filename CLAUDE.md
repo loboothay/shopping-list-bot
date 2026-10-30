@@ -163,9 +163,10 @@ interpreta o próximo texto digitado.
     `STATE_MARKET_MODE`.
   - **Painel**: mensagem própria, fixada no grupo (`send_stock_panel`), separada do menu da
     lista para não trocar a tela de quem está no Modo Mercado. A navegação é compartilhada
-    pelo grupo. `/estoque` e o botão 📦 republicam o painel no fim do chat, e "Voltar ao
-    menu" (`send_list_menu`) publica a lista no fim do chat, sem tocar no painel nem na tela
-    do mercado. Sem permissão de fixar, tudo funciona igual.
+    pelo grupo. `/estoque` e o botão 📦 publicam o painel no fim do chat e fixam. "Voltar
+    ao menu" publica a lista (`send_list_menu`, sem tocar na tela do mercado) e apaga o
+    painel, o que também tira a fixação. Baixa por mensagem não depende do painel. Sem
+    permissão de fixar, tudo funciona igual.
   - **Ligação com a lista**: `sync_stock_item` é o único ponto que liga estoque e lista. Se
     o item voltar ao mínimo, sai da lista. Item manual de mesmo nome é adotado sem reduzir a
     quantidade. Item marcado como comprado não é tocado.
