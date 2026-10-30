@@ -12,7 +12,9 @@ import re
 import json
 import asyncio
 import unicodedata
+import zlib
 from datetime import datetime
+from html import escape
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
@@ -22,7 +24,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 
 # Configurar logging
 logging.basicConfig(
@@ -38,8 +40,10 @@ STATE_REMOVING = 2
 STATE_MARKET_MODE = 3
 STATE_EDIT_RENAME = 4
 STATE_EDIT_QTY = 5
+STATE_STOCK_ADD = 6
+STATE_STOCK_REMOVE = 7
 
-# Armazenamento (persistido em JSON: shopping_lists, category_cache, item_frequency)
+# Armazenamento (persistido em JSON: shopping_lists, category_cache, item_frequency, stock)
 shopping_lists = {}
 user_states = {}
 messages_to_delete = {}
@@ -50,6 +54,13 @@ category_cache = {}
 
 # Frequência de itens: nome_normalizado -> {'count', 'name', 'category'}
 item_frequency = {}
+
+# Estoque: chat_id -> [{'id', 'name', 'package', 'category', 'quantity', 'min', 'ideal'}]
+# A quantidade é sempre em embalagens fechadas; 'package' descreve a embalagem ("5 kg")
+stock = {}
+stock_panels = {}  # chat_id -> message_id do painel do estoque, a mensagem fixada no grupo
+STOCK_MAX_QTY = 999
+STOCK_PAGE_SIZE = 30
 
 # Estado de UI transitório (não persistido)
 edit_target = {}        # state_key -> índice do item em edição
@@ -321,8 +332,250 @@ def register_frequency(name: str, category: str) -> None:
     item_frequency[key] = entry
 
 
+def get_stock(chat_id: int) -> list:
+    return stock.setdefault(chat_id, [])
+
+
+def find_stock_items(chat_id: int, text: str) -> list:
+    """Itens que casam com o texto: nome exato (ou plural); se não houver, trecho do nome."""
+    items = get_stock(chat_id)
+    exact = [it for it in items if same_item(it['name'], text)]
+    if exact:
+        return exact
+    norm = _normalize(text)
+    return [it for it in items if norm in _normalize(it['name'])]
+
+
+def is_low(stock_item: dict) -> bool:
+    """Abaixo do mínimo? Estar exatamente no mínimo ainda é ok."""
+    return stock_item['quantity'] < stock_item['min']
+
+
+def stock_missing(stock_item: dict) -> int:
+    """Quanto comprar para voltar ao ideal."""
+    return max(stock_item['ideal'] - stock_item['quantity'], 0)
+
+
+_PACKAGE_SIZE = re.compile(r'(\d+(?:[.,]\d+)?)\s*(kg|g|l|ml)\b', re.IGNORECASE)
+
+
+def stock_total(stock_item: dict) -> str | None:
+    """Total em kg/L quando a embalagem informa o tamanho ('3 x 5 kg' → '15 kg')."""
+    m = _PACKAGE_SIZE.search(stock_item.get('package', ''))
+    if not m:
+        return None
+    size = float(m.group(1).replace(',', '.')) * stock_item['quantity']
+    unit = m.group(2).lower()
+    if unit in ('g', 'ml') and size >= 1000:
+        size, unit = size / 1000, 'kg' if unit == 'g' else 'l'
+    number = f"{size:.2f}".rstrip('0').rstrip('.').replace('.', ',')
+    return f"{number} {'L' if unit == 'l' else unit}"
+
+
+def stock_amount(stock_item: dict) -> str:
+    """Quantidade para exibir: '3' ou, com tamanho conhecido, '3 (15 kg)'."""
+    total = stock_total(stock_item)
+    return f"{stock_item['quantity']} ({total})" if total else str(stock_item['quantity'])
+
+
+def stock_label(stock_item: dict) -> str:
+    return f"{stock_item['name']} · {stock_amount(stock_item)} · mín {stock_item['min']}"
+
+
+def stock_list_name(stock_item: dict) -> str:
+    """Nome na lista de compras: quem vai ao mercado precisa saber a embalagem."""
+    package = stock_item.get('package')
+    return f"{stock_item['name']} ({package})" if package else stock_item['name']
+
+
+def is_stock_entry(entry: dict, stock_item: dict) -> bool:
+    """O item da lista corresponde ao item do estoque, pelo nome com ou sem embalagem?"""
+    return (same_item(entry['name'], stock_item['name'])
+            or same_item(entry['name'], stock_list_name(stock_item)))
+
+
+def sync_stock_item(chat_id: int, stock_item: dict) -> None:
+    """Reflete um item do estoque na lista de compras.
+
+    Abaixo do mínimo: entra na lista com a quantidade que falta para o ideal. Se voltou
+    ao mínimo (ex.: baixa desfeita), sai da lista. O vínculo é o 'stock_id' do item da
+    lista, que sobrevive a renomear. Item manual de mesmo nome é adotado sem reduzir a
+    quantidade digitada. Item já no carrinho fica como está: é reconciliado ao finalizar.
+    """
+    init_list(chat_id)
+    items = shopping_lists[chat_id]['items']
+    entry = next((it for it in items if it.get('stock_id') == stock_item['id']), None)
+    if entry is None:
+        entry = next((it for it in items if is_stock_entry(it, stock_item)), None)
+
+    if entry is not None and entry.get('bought', False):
+        return
+
+    if is_low(stock_item):
+        missing = min(stock_missing(stock_item), 99)
+        if entry is None:
+            items.append({
+                'name': stock_list_name(stock_item),
+                'bought': False,
+                'category': stock_item['category'],
+                'quantity': missing,
+                'stock_id': stock_item['id'],
+            })
+        elif 'stock_id' in entry:
+            entry['quantity'] = missing
+        else:
+            entry['quantity'] = max(entry.get('quantity', 1), missing)
+            entry['stock_id'] = stock_item['id']
+        sort_items_by_category(items)
+    elif entry is not None and 'stock_id' in entry:
+        items.remove(entry)
+
+
+def sync_all_stock(chat_id: int) -> None:
+    for stock_item in get_stock(chat_id):
+        sync_stock_item(chat_id, stock_item)
+
+
+def change_stock(chat_id: int, stock_item: dict, delta: int) -> None:
+    """Soma delta à quantidade (limitada a 0–STOCK_MAX_QTY) e atualiza a lista de compras."""
+    stock_item['quantity'] = max(0, min(stock_item['quantity'] + delta, STOCK_MAX_QTY))
+    sync_stock_item(chat_id, stock_item)
+    save_data()
+
+
+def restock_bought(chat_id: int) -> list:
+    """Dá entrada no estoque do que foi comprado e tira esses itens da lista.
+
+    Por tirar da lista, não soma duas vezes. Quem não está no estoque fica como está.
+    Retorna os textos de entrada ('+3 Arroz') para exibir ao usuário.
+    """
+    init_list(chat_id)
+    items = shopping_lists[chat_id]['items']
+    stock_items = get_stock(chat_id)
+    received = []
+    for entry in [it for it in items if it.get('bought', False)]:
+        stock_item = next((s for s in stock_items if s['id'] == entry.get('stock_id')), None)
+        if stock_item is None:
+            stock_item = next((s for s in stock_items if is_stock_entry(entry, s)), None)
+        if stock_item is None:
+            continue
+        qty = entry.get('quantity', 1)
+        stock_item['quantity'] = min(stock_item['quantity'] + qty, STOCK_MAX_QTY)
+        items.remove(entry)
+        received.append(f"+{qty} {stock_item['name']}")
+    sync_all_stock(chat_id)
+    return received
+
+
+def get_received_text(received: list) -> str:
+    return f"📦 Entrada no estoque: {escape(', '.join(received))}\n" if received else ""
+
+
+# "arroz (5 kg) 3/2/4" = atual/mínimo/ideal; embalagem, mínimo e ideal são opcionais
+_STOCK_ENTRY = re.compile(r'^(.+?)\s*(?:\(([^)]*)\))?\s+(\d{1,3})(?:/(\d{1,3}))?(?:/(\d{1,3}))?$')
+
+
+def parse_stock_entry(text: str) -> tuple | None:
+    """Extrai (nome, embalagem, atual, mínimo, ideal). O que faltar vem None."""
+    m = _STOCK_ENTRY.match(text.strip())
+    if not m:
+        return None
+    name, package, qty, min_qty, ideal = m.groups()
+    return (
+        name.strip(),
+        package.strip() if package else None,
+        int(qty),
+        int(min_qty) if min_qty is not None else None,
+        int(ideal) if ideal is not None else None,
+    )
+
+
+def split_stock_lines(text: str) -> list:
+    """Separa por linha ou vírgula, sem cortar a vírgula da embalagem ('(2,4 kg)')."""
+    return [p.strip() for p in re.split(r',(?![^(]*\))|\n', text) if p.strip()]
+
+
+def category_from_line(line: str) -> str | None:
+    """A linha é só o nome de uma seção? Vale para as linhas seguintes do cadastro."""
+    norm = _normalize(line).rstrip(':')
+    return next((cat for cat in CATEGORY_ORDER if _normalize(cat) == norm), None)
+
+
+def upsert_stock_item(chat_id: int, name: str, package: str | None, category: str, qty: int,
+                      min_qty: int | None, ideal: int | None) -> dict:
+    """Cadastra o item ou, se já existe, atualiza só o que foi informado.
+
+    Item novo sem mínimo usa 1; sem ideal usa 1,5 vez o mínimo, arredondado para cima
+    (mínimo de 2 meses, repor até 3). Ideal nunca fica abaixo do mínimo, senão o item
+    entraria na lista com quantidade zero.
+    """
+    items = get_stock(chat_id)
+    stock_item = next((it for it in items if same_item(it['name'], name)), None)
+    if stock_item is None:
+        min_value = 1 if min_qty is None else min_qty
+        stock_item = {
+            'id': max((it['id'] for it in items), default=0) + 1,
+            'name': name,
+            'package': package or '',
+            'category': category,
+            'quantity': qty,
+            'min': min_value,
+            'ideal': (min_value * 3 + 1) // 2 if ideal is None else ideal,
+        }
+        items.append(stock_item)
+    else:
+        stock_item['quantity'] = qty
+        if package is not None:
+            stock_item['package'] = package
+        if min_qty is not None:
+            stock_item['min'] = min_qty
+        if ideal is not None:
+            stock_item['ideal'] = ideal
+    stock_item['ideal'] = max(stock_item['ideal'], stock_item['min'])
+    sync_stock_item(chat_id, stock_item)
+    return stock_item
+
+
+def remove_stock_item(chat_id: int, stock_item: dict) -> None:
+    """Tira do estoque. Na lista o item continua, mas vira um item manual comum."""
+    init_list(chat_id)
+    for entry in shopping_lists[chat_id]['items']:
+        if entry.get('stock_id') == stock_item['id']:
+            entry.pop('stock_id')
+    get_stock(chat_id).remove(stock_item)
+
+
+def move_stock_by_text(chat_id: int, text: str, sign: int) -> tuple:
+    """Aplica '2 arroz, feijão' ao estoque: sign -1 dá baixa, +1 dá entrada.
+
+    Só mexe quando o texto aponta para um único item. Retorna (linhas de resposta em
+    HTML, se algum item foi movimentado).
+    """
+    linhas = []
+    moved = False
+    for part in [p.strip() for p in text.split(',') if p.strip()]:
+        qty, name = parse_quantity(part)
+        matches = find_stock_items(chat_id, name) if len(name) >= 2 else []
+
+        if not matches:
+            linhas.append(f"❓ {escape(name)}: não está no estoque")
+        elif len(matches) > 1:
+            opcoes = ', '.join(escape(it['name']) for it in matches[:6])
+            linhas.append(f"❓ {escape(name)}: qual? {opcoes}")
+        else:
+            stock_item = matches[0]
+            before = stock_item['quantity']
+            change_stock(chat_id, stock_item, sign * qty)
+            moved = True
+            linha = f"{'➖' if sign < 0 else '➕'} {escape(stock_item['name'])}: {before} → {escape(stock_amount(stock_item))}"
+            if is_low(stock_item):
+                linha += f" | 🛒 comprar {stock_missing(stock_item)}"
+            linhas.append(linha)
+    return linhas, moved
+
+
 def save_data() -> None:
-    """Salva lista, cache de categorias e frequências em JSON (Volume do Railway)."""
+    """Salva lista, cache de categorias, frequências e estoque em JSON (Volume do Railway)."""
     try:
         lists_serial = {}
         for chat_id, data in shopping_lists.items():
@@ -335,6 +588,8 @@ def save_data() -> None:
             'shopping_lists': lists_serial,
             'category_cache': category_cache,
             'item_frequency': item_frequency,
+            'stock': {str(chat_id): items for chat_id, items in stock.items()},
+            'stock_panels': {str(chat_id): msg_id for chat_id, msg_id in stock_panels.items()},
         }
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = DATA_FILE + '.tmp'
@@ -368,6 +623,10 @@ def load_data() -> None:
 
         category_cache.update(payload.get('category_cache', {}))
         item_frequency.update(payload.get('item_frequency', {}))
+        for chat_id_str, items in payload.get('stock', {}).items():
+            stock[int(chat_id_str)] = items
+        for chat_id_str, msg_id in payload.get('stock_panels', {}).items():
+            stock_panels[int(chat_id_str)] = msg_id
         logger.info(f"✅ Dados carregados: {len(shopping_lists)} lista(s).")
     except Exception as e:
         logger.warning(f"⚠️ Falha ao carregar dados: {e}")
@@ -401,7 +660,7 @@ def get_list_text(items: list, show_status: bool = True) -> str:
 
         for item in group:
             counter += 1
-            name = item_label(item)
+            name = escape(item_label(item))
             bought = item.get('bought', False)
 
             if show_status and bought:
@@ -418,6 +677,15 @@ def item_label(item: dict) -> str:
     name = item['name']
     qty = item.get('quantity', 1)
     return f"{qty}x {name}" if qty > 1 else name
+
+
+def item_tag(item: dict) -> str:
+    """Identifica o item no botão do modo mercado.
+
+    Baixas no estoque podem mudar a lista enquanto alguém está no mercado. Com o índice
+    sozinho, um teclado desatualizado marcaria o item errado.
+    """
+    return f"{zlib.crc32(_normalize(item['name']).encode()):x}"
 
 
 def get_main_menu_text(items: list) -> str:
@@ -457,10 +725,123 @@ def get_main_menu_keyboard(has_items: bool = False, has_frequent: bool = False):
         ])
 
     keyboard.append([
+        InlineKeyboardButton("📦 Estoque", callback_data='stock_open')
+    ])
+
+    keyboard.append([
         InlineKeyboardButton("🗑️ Limpar Tudo", callback_data='action_clear')
     ])
 
     return InlineKeyboardMarkup(keyboard)
+
+
+def get_stock_menu_text(chat_id: int) -> str:
+    """Texto da tela principal do estoque (HTML)."""
+    items = get_stock(chat_id)
+    header = "📦 <b>ESTOQUE</b>\n━━━━━━━━━━━━━━━\n"
+    if not items:
+        return header + "📋 Nada cadastrado ainda.\n\nToque em ➕ Cadastrar para começar."
+
+    low = sum(1 for item in items if is_low(item))
+    status = f"📊 <b>{len(items)} item(ns)</b>"
+    if low:
+        status += f" | 🔴 {low} abaixo do mínimo"
+    return (
+        header + f"{status}\n\nEscolha a seção para dar baixa, ou mande no grupo:\n"
+        "<code>-2 arroz</code> para tirar, <code>+1 arroz</code> para devolver."
+    )
+
+
+def get_stock_menu_keyboard(chat_id: int):
+    """Teclado do estoque: uma entrada por categoria que tem itens."""
+    items = get_stock(chat_id)
+    keyboard = []
+    row = []
+    for cat_idx, category in enumerate(CATEGORY_ORDER):
+        group = [item for item in items if item['category'] == category]
+        if not group:
+            continue
+        low = sum(1 for item in group if is_low(item))
+        label = f"{CATEGORY_EMOJI.get(category, '📦')} {category} ({len(group)})"
+        if low:
+            label += f" 🔴{low}"
+        row.append(InlineKeyboardButton(label, callback_data=f'stock_cat_{cat_idx}_0'))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("➕ Cadastrar / Atualizar", callback_data='stock_add')])
+    if items:
+        keyboard.append([InlineKeyboardButton("🗑️ Tirar do estoque", callback_data='stock_del')])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_stock_category_text(cat_idx: int) -> str:
+    """Cabeçalho da tela de baixa de uma categoria."""
+    category = CATEGORY_ORDER[cat_idx]
+    return (
+        f"{CATEGORY_EMOJI.get(category, '📦')} <b>{category}</b>\n━━━━━━━━━━━━━━━\n"
+        "Toque no item para dar baixa de 1 embalagem.\n🔴 = abaixo do mínimo"
+    )
+
+
+def get_stock_category_keyboard(chat_id: int, cat_idx: int, page: int = 0, undo_item: dict = None):
+    """Um botão por item (toque = baixa de 1), paginado para respeitar o limite do Telegram.
+
+    Os botões usam o 'id' do item, não o índice: um teclado desatualizado continua
+    apontando para o item certo. undo_item mostra o botão de devolver o que acabou de
+    ser mexido.
+    """
+    category = CATEGORY_ORDER[cat_idx]
+    group = sorted(
+        (item for item in get_stock(chat_id) if item['category'] == category),
+        key=lambda item: _normalize(item['name']),
+    )
+    last_page = max(len(group) - 1, 0) // STOCK_PAGE_SIZE
+    page = max(0, min(page, last_page))
+    start = page * STOCK_PAGE_SIZE
+
+    keyboard = []
+    if undo_item is not None:
+        keyboard.append([InlineKeyboardButton(
+            f"↩️ Devolver 1 {undo_item['name']}",
+            callback_data=f"stock_up_{undo_item['id']}_{cat_idx}_{page}",
+        )])
+
+    for item in group[start:start + STOCK_PAGE_SIZE]:
+        mark = '🔴' if is_low(item) else '➖'
+        keyboard.append([InlineKeyboardButton(
+            f"{mark} {stock_label(item)}",
+            callback_data=f"stock_dn_{item['id']}_{cat_idx}_{page}",
+        )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f'stock_cat_{cat_idx}_{page - 1}'))
+    if page < last_page:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f'stock_cat_{cat_idx}_{page + 1}'))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton("⬅️ Voltar", callback_data='stock_menu')])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_stock_names_text(chat_id: int, limit: int = 3500) -> str:
+    """Nomes do estoque em HTML, cortados em um nome inteiro para caber na mensagem."""
+    text = ''
+    for name in sorted(escape(item['name']) for item in get_stock(chat_id)):
+        if len(text) + len(name) > limit:
+            return text + ', …'
+        text += f', {name}' if text else name
+    return text
+
+
+def get_stock_back_keyboard():
+    """Teclado das telas que esperam texto do usuário."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Voltar", callback_data='stock_menu')]])
 
 
 def get_cancel_keyboard():
@@ -529,7 +910,7 @@ def get_market_mode_keyboard(items: list, hide_bought: bool = False):
                 btn_text = f"⬜ {name}"
 
             keyboard.append([
-                InlineKeyboardButton(btn_text, callback_data=f'toggle_{i}')
+                InlineKeyboardButton(btn_text, callback_data=f'toggle_{i}_{item_tag(item)}')
             ])
 
     has_bought = any(item.get('bought', False) for item in items)
@@ -682,6 +1063,77 @@ async def update_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     menu_messages[chat_id] = msg.message_id
 
 
+async def edit_stock_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    """Atualiza o painel do estoque. Retorna False se ele não existe mais."""
+    if chat_id not in stock_panels:
+        return False
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=stock_panels[chat_id],
+            text=get_stock_menu_text(chat_id),
+            parse_mode='HTML',
+            reply_markup=get_stock_menu_keyboard(chat_id)
+        )
+    except BadRequest as e:
+        return 'not modified' in str(e).lower()
+    return True
+
+
+async def send_stock_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Publica o painel no fim do chat e fixa, para ficar a um toque de distância.
+
+    É uma mensagem separada do menu da lista: mexer no estoque não troca a tela de quem
+    está no modo mercado. Sem permissão para fixar, o painel funciona do mesmo jeito.
+    """
+    if chat_id in stock_panels:
+        await delete_message_safe(context, chat_id, stock_panels[chat_id])
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=get_stock_menu_text(chat_id),
+        parse_mode='HTML',
+        reply_markup=get_stock_menu_keyboard(chat_id)
+    )
+    stock_panels[chat_id] = msg.message_id
+    save_data()
+
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=chat_id, message_id=msg.message_id, disable_notification=True
+        )
+    except TelegramError as e:
+        logger.warning(f"⚠️ Não consegui fixar o painel do estoque: {e}")
+
+
+async def refresh_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Atualiza a lista depois de um movimento. Não toca na tela do modo mercado."""
+    if chat_id not in menu_messages or chat_id in market_hide_bought:
+        return
+    items = shopping_lists[chat_id]['items']
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=menu_messages[chat_id],
+            text=get_main_menu_text(items),
+            parse_mode='HTML',
+            reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+        )
+    except BadRequest:
+        pass
+
+
+async def refresh_views(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    await edit_stock_panel(context, chat_id)
+    await refresh_list_menu(context, chat_id)
+
+
+async def delete_own_pin_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apaga o aviso 'fixou uma mensagem' que o próprio bot gera ao fixar o painel."""
+    if update.effective_user and update.effective_user.id == context.bot.id:
+        await delete_message_safe(context, update.effective_chat.id, update.message.message_id)
+
+
 async def set_bot_commands(application: Application) -> None:
     """Define os comandos do bot"""
     commands = [
@@ -690,6 +1142,8 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("list", "Ver lista"),
         BotCommand("remove", "Remover item"),
         BotCommand("market", "Modo mercado"),
+        BotCommand("estoque", "Abrir o painel do estoque"),
+        BotCommand("baixa", "Dar baixa (ex.: /baixa 2 arroz)"),
         BotCommand("clear", "Limpar lista"),
         BotCommand("cancel", "Cancelar"),
     ]
@@ -857,6 +1311,40 @@ async def market_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     menu_messages[chat_id] = msg.message_id
 
 
+async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando /estoque: republica e fixa o painel do estoque"""
+    chat_id = update.effective_chat.id
+    user_states[get_user_state_key(chat_id, update.effective_user.id)] = STATE_NONE
+
+    await delete_message_safe(context, chat_id, update.message.message_id)
+    await send_stock_panel(context, chat_id)
+
+
+async def stock_out_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando /baixa: '/baixa 2 arroz, feijão'. Sem argumentos, abre o estoque.
+
+    Alternativa à mensagem '-2 arroz', e funciona mesmo sem o bot ler as mensagens do grupo.
+    """
+    if not context.args:
+        await stock_command(update, context)
+        return
+
+    chat_id = update.effective_chat.id
+    await delete_message_safe(context, chat_id, update.message.message_id)
+
+    linhas, moved = move_stock_by_text(chat_id, ' '.join(context.args), -1)
+    await show_stock_moves(context, chat_id, linhas, moved)
+
+
+async def show_stock_moves(context: ContextTypes.DEFAULT_TYPE, chat_id: int, linhas: list, moved: bool) -> None:
+    """Mostra o resultado de um movimento por texto e atualiza as telas."""
+    if moved:
+        await refresh_views(context, chat_id)
+    msg = await context.bot.send_message(chat_id=chat_id, text="\n".join(linhas) or "⚠️ <b>Nada para fazer.</b>", parse_mode='HTML')
+    await asyncio.sleep(3)
+    await delete_message_safe(context, chat_id, msg.message_id)
+
+
 async def clear_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Comando /clear"""
     chat_id = update.effective_chat.id
@@ -914,6 +1402,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update_menu(context, chat_id)
 
 
+# "-2 arroz" tira, "+1 arroz" devolve. O iPhone pode trocar o hífen por travessão.
+_STOCK_MOVE = re.compile(r'^([-–—−+])\s*(\S.*)$', re.DOTALL)
+
+
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Processa mensagens de texto"""
     chat_id = update.effective_chat.id
@@ -923,10 +1415,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     state_key = get_user_state_key(chat_id, user_id)
     current_state = user_states.get(state_key, STATE_NONE)
-    
-    if current_state == STATE_NONE:
+
+    # Nos estados sem digitação, o texto é conversa do grupo, exceto "-2 arroz" e "+1 arroz".
+    # Quem saiu do modo mercado sem finalizar continua em STATE_MARKET_MODE.
+    if current_state in (STATE_NONE, STATE_MARKET_MODE):
+        m = _STOCK_MOVE.match(text)
+        if m:
+            sign = 1 if m.group(1) == '+' else -1
+            linhas, moved = move_stock_by_text(chat_id, m.group(2), sign)
+            # Sem nenhum item reconhecido, pode ser conversa: a mensagem da pessoa fica
+            if moved:
+                await delete_message_safe(context, chat_id, update.message.message_id)
+            await show_stock_moves(context, chat_id, linhas, moved)
         return
-    
+
     await delete_message_safe(context, chat_id, update.message.message_id)
     
     # ADICIONANDO (um ou vários itens separados por vírgula; aceita quantidade "2x leite")
@@ -1089,6 +1591,193 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         save_data()
         await update_menu(context, chat_id)
 
+    # ESTOQUE: cadastrar/atualizar ("arroz 3/2/5"), separados por vírgula ou por linha
+    elif current_state == STATE_STOCK_ADD:
+        user_states[state_key] = STATE_NONE
+
+        entries = []      # (nome, embalagem, atual, mínimo, ideal, seção escolhida ou None)
+        ignored = []
+        section = None
+        for line in split_stock_lines(text):
+            header = category_from_line(line)
+            if header:
+                section = header
+                continue
+            entry = parse_stock_entry(line)
+            if entry is None or len(entry[0]) < 2:
+                ignored.append(line)
+            else:
+                entries.append((*entry, section))
+
+        organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
+
+        new_names = [
+            entry[0] for entry in entries
+            if entry[5] is None and not any(same_item(it['name'], entry[0]) for it in get_stock(chat_id))
+        ]
+        categories = await categorize_items(new_names) if new_names else {}
+
+        saved = []
+        for name, package, qty, min_qty, ideal, entry_section in entries:
+            category = entry_section or categories.get(name, 'Outros')
+            saved.append(upsert_stock_item(chat_id, name, package, category, qty, min_qty, ideal))
+            if entry_section:
+                saved[-1]['category'] = entry_section
+        save_data()
+
+        await delete_message_safe(context, chat_id, organizing.message_id)
+
+        if len(saved) <= 15:
+            linhas = [
+                f"✅ {escape(it['name'])}: {it['quantity']} (mín {it['min']}, ideal {it['ideal']})"
+                for it in saved
+            ]
+        else:
+            linhas = [f"✅ <b>{len(saved)} itens salvos</b>"]
+        to_buy = sum(1 for it in saved if is_low(it))
+        if to_buy:
+            linhas.append(f"🛒 {to_buy} foi(ram) para a lista de compras")
+        if ignored:
+            linhas.append(f"⚠️ Ignorado(s), faltou a quantidade: {escape(', '.join(ignored[:10]))}")
+
+        msg = await context.bot.send_message(chat_id=chat_id, text="\n".join(linhas) or "⚠️ <b>Nada para salvar.</b>", parse_mode='HTML')
+        await asyncio.sleep(2.5)
+        await delete_message_safe(context, chat_id, msg.message_id)
+        await refresh_views(context, chat_id)
+
+    # ESTOQUE: tirar itens (por nome, separados por vírgula)
+    elif current_state == STATE_STOCK_REMOVE:
+        user_states[state_key] = STATE_NONE
+
+        removed, not_found = [], []
+        for part in [p.strip() for p in text.split(',') if p.strip()]:
+            matches = [it for it in get_stock(chat_id) if same_item(it['name'], part)]
+            if matches:
+                remove_stock_item(chat_id, matches[0])
+                removed.append(matches[0]['name'])
+            else:
+                not_found.append(part)
+        save_data()
+
+        linhas = []
+        if removed:
+            linhas.append(f"✅ Fora do estoque: {escape(', '.join(removed))}")
+        if not_found:
+            linhas.append(f"❓ Não encontrado(s): {escape(', '.join(not_found))}")
+        msg = await context.bot.send_message(chat_id=chat_id, text="\n".join(linhas) or "⚠️ <b>Nada para tirar.</b>", parse_mode='HTML')
+        await asyncio.sleep(2)
+        await delete_message_safe(context, chat_id, msg.message_id)
+        await refresh_views(context, chat_id)
+
+
+async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_key: str) -> None:
+    """Processa os botões 'stock_*'. Responde o clique aqui para poder mostrar o aviso."""
+    chat_id = query.message.chat_id
+    parts = query.data.split('_')
+    action = parts[1]
+
+    # Botão do menu da lista: publica o painel
+    if action == 'open':
+        await query.answer()
+        await send_stock_panel(context, chat_id)
+
+    # Tela principal do estoque
+    elif action == 'menu':
+        user_states[state_key] = STATE_NONE
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                get_stock_menu_text(chat_id),
+                parse_mode='HTML',
+                reply_markup=get_stock_menu_keyboard(chat_id)
+            )
+        except BadRequest:
+            pass
+
+    # Cadastrar / atualizar: pede o texto
+    elif action == 'add':
+        user_states[state_key] = STATE_STOCK_ADD
+        await query.answer()
+        await query.edit_message_text(
+            "➕ <b>CADASTRAR / ATUALIZAR</b>\n━━━━━━━━━━━━━━━\n"
+            "Digite <b>nome (embalagem) tem/mínimo/repor até</b>, um por linha:\n\n"
+            "<code>Arroz (5 kg) 4/3/4</code>\n"
+            "<code>Feijão (1 kg) 3/1/2</code>\n\n"
+            "• As quantidades são em embalagens fechadas.\n"
+            "• Abaixo do mínimo, vai para a lista com o que falta para repor.\n"
+            "• Sem \"repor até\", uso 1,5 vez o mínimo. Sem mínimo, uso 1.\n"
+            "• Uma linha com o nome da seção (<code>Limpeza</code>) vale para as seguintes.\n"
+            "• Item já cadastrado: <code>arroz 4</code> só corrige a quantidade.",
+            parse_mode='HTML',
+            reply_markup=get_stock_back_keyboard()
+        )
+
+    # Tirar do estoque: pede os nomes
+    elif action == 'del':
+        user_states[state_key] = STATE_STOCK_REMOVE
+        await query.answer()
+        await query.edit_message_text(
+            f"🗑️ <b>TIRAR DO ESTOQUE</b>\n━━━━━━━━━━━━━━━\n{get_stock_names_text(chat_id)}\n\n"
+            "Digite o(s) nome(s), separando por vírgula:",
+            parse_mode='HTML',
+            reply_markup=get_stock_back_keyboard()
+        )
+
+    # Abrir uma categoria
+    elif action == 'cat':
+        cat_idx, page = int(parts[2]), int(parts[3])
+        user_states[state_key] = STATE_NONE
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                get_stock_category_text(cat_idx),
+                parse_mode='HTML',
+                reply_markup=get_stock_category_keyboard(chat_id, cat_idx, page)
+            )
+        except BadRequest:
+            pass
+
+    # Baixa ou devolução de 1 unidade
+    elif action in ('dn', 'up'):
+        item_id, cat_idx, page = int(parts[2]), int(parts[3]), int(parts[4])
+        stock_item = next((it for it in get_stock(chat_id) if it['id'] == item_id), None)
+
+        if stock_item is None:
+            await query.answer("Esse item não está mais no estoque.")
+            try:
+                await query.edit_message_text(
+                    get_stock_category_text(cat_idx),
+                    parse_mode='HTML',
+                    reply_markup=get_stock_category_keyboard(chat_id, cat_idx, page)
+                )
+            except BadRequest:
+                pass
+            return
+
+        if action == 'dn' and stock_item['quantity'] == 0:
+            await query.answer(f"{stock_item['name']} já está zerado.")
+            return
+
+        before = stock_item['quantity']
+        change_stock(chat_id, stock_item, -1 if action == 'dn' else 1)
+
+        aviso = f"{stock_item['name']}: {before} → {stock_amount(stock_item)}"
+        if is_low(stock_item):
+            aviso += f" | 🛒 comprar {stock_missing(stock_item)}"
+        await query.answer(aviso)
+
+        try:
+            await query.edit_message_text(
+                get_stock_category_text(cat_idx),
+                parse_mode='HTML',
+                reply_markup=get_stock_category_keyboard(chat_id, cat_idx, page, undo_item=stock_item)
+            )
+        except BadRequest:
+            pass
+
+        # O painel é a mensagem tocada; só a lista precisa ser atualizada
+        await refresh_list_menu(context, chat_id)
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Processa cliques nos botões"""
@@ -1096,9 +1785,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     chat_id = query.message.chat_id
     user_id = query.from_user.id
     user_name = query.from_user.first_name
-    
+
+    if query.data.startswith('stock_'):
+        await handle_stock_button(query, context, get_user_state_key(chat_id, user_id))
+        return
+
     await query.answer()
-    
+
     state_key = get_user_state_key(chat_id, user_id)
     init_list(chat_id)
 
@@ -1176,8 +1869,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # TOGGLE ITEM
     elif query.data.startswith('toggle_'):
-        index = int(query.data.split('_')[1])
+        parts = query.data.split('_')
+        index = int(parts[1])
         items = shopping_lists[chat_id]['items']
+
+        # A lista pode ter mudado desde que o teclado foi desenhado: o tag acha o item certo
+        if len(parts) > 2:
+            index = next((i for i, it in enumerate(items) if item_tag(it) == parts[2]), -1)
 
         if 0 <= index < len(items):
             items[index]['bought'] = not items[index].get('bought', False)
@@ -1197,19 +1895,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_states[state_key] = STATE_NONE
         market_hide_bought.pop(chat_id, None)
         items = shopping_lists[chat_id]['items']
-        save_data()
 
         bought_count = sum(1 for item in items if item.get('bought', False))
-        
+        received = restock_bought(chat_id)
+        save_data()
+
         menu_text = get_main_menu_text(items)
         has_items = len(items) > 0
-        
+
         await query.edit_message_text(
-            f"✅ <b>Compras finalizadas!</b>\n{bought_count} item(ns) marcado(s)\n\n{menu_text}",
+            f"✅ <b>Compras finalizadas!</b>\n{bought_count} item(ns) marcado(s)\n{get_received_text(received)}\n{menu_text}",
             parse_mode='HTML',
             reply_markup=get_main_menu_keyboard(has_items, has_frequent_items(chat_id))
         )
-    
+        await edit_stock_panel(context, chat_id)
+
     # CANCELAR MODO MERCADO
     elif query.data == 'market_cancel':
         user_states[state_key] = STATE_NONE
@@ -1218,6 +1918,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         items = shopping_lists[chat_id]['items']
         for item in items:
             item['bought'] = False
+        sync_all_stock(chat_id)
         save_data()
 
         menu_text = get_main_menu_text(items)
@@ -1234,27 +1935,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         items = shopping_lists[chat_id]['items']
 
         removed_count = sum(1 for item in items if item.get('bought', False))
+        received = restock_bought(chat_id)
         shopping_lists[chat_id]['items'] = [item for item in items if not item.get('bought', False)]
         save_data()
         market_hide_bought[chat_id] = False
 
         items = shopping_lists[chat_id]['items']
+        received_text = get_received_text(received)
 
         if items:
             await query.edit_message_text(
-                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n{get_market_header_text(items)}",
+                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n{received_text}\n{get_market_header_text(items)}",
                 parse_mode='HTML',
                 reply_markup=get_market_mode_keyboard(items, market_hide_bought[chat_id])
             )
+            await edit_stock_panel(context, chat_id)
         else:
             user_states[state_key] = STATE_NONE
             market_hide_bought.pop(chat_id, None)
             menu_text = get_main_menu_text([])
             await query.edit_message_text(
-                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n\n{menu_text}",
+                f"🧹 <b>{removed_count} item(ns) removido(s)!</b>\n{received_text}\n{menu_text}",
                 parse_mode='HTML',
                 reply_markup=get_main_menu_keyboard(False, has_frequent_items(chat_id))
             )
+            await edit_stock_panel(context, chat_id)
     
     # LIMPAR TUDO
     elif query.data == 'action_clear':
@@ -1478,6 +2183,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
 
 
+def register_handlers(application: Application) -> None:
+    """Registra comandos, botões e texto na aplicação"""
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("list", show_list))
+    application.add_handler(CommandHandler("add", add_item_command))
+    application.add_handler(CommandHandler("remove", remove_item_command))
+    application.add_handler(CommandHandler("market", market_mode_command))
+    application.add_handler(CommandHandler("estoque", stock_command))
+    application.add_handler(CommandHandler("baixa", stock_out_command))
+    application.add_handler(CommandHandler("clear", clear_list_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, delete_own_pin_notice))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+
+
 def main() -> None:
     """Inicia o bot"""
     bot_token = os.getenv('BOT_TOKEN')
@@ -1491,17 +2212,8 @@ def main() -> None:
     load_data()
 
     application = Application.builder().token(bot_token).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("list", show_list))
-    application.add_handler(CommandHandler("add", add_item_command))
-    application.add_handler(CommandHandler("remove", remove_item_command))
-    application.add_handler(CommandHandler("market", market_mode_command))
-    application.add_handler(CommandHandler("clear", clear_list_command))
-    application.add_handler(CommandHandler("cancel", cancel_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    
+    register_handlers(application)
+
     application.post_init = set_bot_commands
     
     logger.info("🤖 Bot iniciado!")
