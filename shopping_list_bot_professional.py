@@ -1153,7 +1153,7 @@ async def send_stock_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> 
 
 
 async def send_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
-    """Publica o menu da lista no fim do chat. O painel continua fixado.
+    """Publica o menu da lista no fim do chat.
 
     Com o modo mercado aberto, a tela de quem está comprando fica intacta: o novo menu
     é uma mensagem à parte, e menu_messages continua apontando para o mercado.
@@ -1776,6 +1776,13 @@ async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_k
         user_states[state_key] = STATE_NONE
         await query.answer()
         await send_list_menu(context, chat_id)
+
+        # Fecha o painel para o chat não acumular telas. Apagar também tira a fixação
+        panel_id = query.message.message_id
+        await delete_message_safe(context, chat_id, panel_id)
+        if stock_panels.get(chat_id) == panel_id:
+            del stock_panels[chat_id]
+            save_data()
 
     # Tela principal do estoque
     elif action == 'menu':
