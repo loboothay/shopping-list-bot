@@ -73,6 +73,7 @@ Tudo está em `shopping_list_bot_professional.py`. Pontos principais:
   o estoque do chat, em embalagens fechadas. **Persistido.** Itens da lista criados ou
   adotados pelo estoque têm `stock_id`.
 - `stock_panels[chat_id]` → id da mensagem do painel do estoque. **Persistido.**
+- `stock_seeded` → chats que já passaram pela carga inicial. **Persistido.**
 - `user_states[f"{chat_id}_{user_id}"]` → estado atual do usuário. (memória)
 - `messages_to_delete`, `menu_messages` → controle de mensagens/menu. (memória)
 - `edit_target[state_key]` → índice do item em edição; `freq_suggestions[chat_id]` →
@@ -189,8 +190,11 @@ interpreta o próximo texto digitado.
 - **A IA roda via `AsyncAnthropic`** (cliente assíncrono) dentro do handler — nunca usar
   o cliente síncrono, pois bloquearia o long polling. Sempre num `try/except` com
   fallback para "Outros".
-- **O repositório é público**: não versionar o inventário real da casa. A carga inicial é
-  feita colando o texto no fluxo de Cadastrar, e os dados ficam só no Volume.
+- **Carga inicial**: `estoque_inicial.txt` tem o inventário da casa, no formato do
+  Cadastrar, e é público por decisão da dona do bot. `seed_groups` carrega o arquivo na
+  subida, nos grupos que já têm lista salva; `/carregarestoque` faz o mesmo no chat atual.
+  `stock_seeded` garante uma única carga por chat. O estoque vivo fica no Volume: editar o
+  arquivo não altera um chat já carregado.
 - **Toda alteração de quantidade do estoque passa por `sync_stock_item`** (`change_stock`
   já faz isso), senão a lista de compras fica defasada.
 - **Idioma**: código, comentários e mensagens ao usuário em **português**. Mantenha
