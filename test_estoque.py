@@ -537,6 +537,48 @@ class PainelTest(StockTestCase):
         self.assertIn('ESTOQUE', self.panel_text())
         self.assertIn('LISTA DE MERCADO', self.menu_text())
 
+    async def test_botao_voltar_ao_menu_existe_com_e_sem_itens(self):
+        await self.send('/estoque')
+        self.find_button('Voltar ao menu')
+        await self.register('arroz 5/1/5')
+        self.find_button('Voltar ao menu')
+
+    async def test_voltar_ao_menu_mostra_a_lista_e_mantem_o_painel_fixado(self):
+        await self.press('Estoque')
+        menu_antigo, painel = self.menu_id, self.panel_id
+        await self.press('Voltar ao menu')
+        self.assertIn('LISTA DE MERCADO', self.menu_text())
+        self.assertIn(menu_antigo, self.api.deleted)
+        self.assertNotEqual(self.menu_id, menu_antigo)
+        self.assertEqual(self.panel_id, painel)
+        self.assertIn('ESTOQUE', self.panel_text())
+
+    async def test_vai_e_volta_entre_menu_e_estoque(self):
+        for _ in range(3):
+            await self.press('Estoque')
+            await self.press('Voltar ao menu')
+        self.assertIn('LISTA DE MERCADO', self.menu_text())
+        self.assertIn('ESTOQUE', self.panel_text())
+
+    async def test_voltar_ao_menu_cancela_o_cadastro_em_andamento(self):
+        await self.send('/estoque')
+        await self.press('Cadastrar')
+        await self.press('Voltar')
+        await self.press('Voltar ao menu')
+        await self.send('arroz 3/2/5')
+        self.assertEqual(self.stock, [])
+
+    async def test_voltar_ao_menu_nao_derruba_quem_esta_no_mercado(self):
+        await self.send('/add')
+        await self.send('leite')
+        await self.send('/market')
+        mercado, tela = self.menu_id, self.menu_text()
+        await self.send('/estoque', user=OTHER)
+        await self.press('Voltar ao menu', user=OTHER)
+        self.assertEqual(self.menu_id, mercado)
+        self.assertEqual(self.menu_text(), tela)
+        self.assertNotIn(mercado, self.api.deleted)
+
     async def test_voltar_da_secao_retorna_ao_painel(self):
         await self.register('arroz 5/1/5')
         await self.open_category('Mercearia')
