@@ -820,6 +820,7 @@ def get_stock_menu_keyboard(chat_id: int):
     keyboard.append([InlineKeyboardButton("➕ Cadastrar / Atualizar", callback_data='stock_add')])
     if items:
         keyboard.append([InlineKeyboardButton("🗑️ Tirar do estoque", callback_data='stock_del')])
+    keyboard.append([InlineKeyboardButton("⬅️ Voltar ao menu", callback_data='stock_list')])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -1149,6 +1150,29 @@ async def send_stock_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> 
         )
     except TelegramError as e:
         logger.warning(f"⚠️ Não consegui fixar o painel do estoque: {e}")
+
+
+async def send_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Publica o menu da lista no fim do chat. O painel continua fixado.
+
+    Com o modo mercado aberto, a tela de quem está comprando fica intacta: o novo menu
+    é uma mensagem à parte, e menu_messages continua apontando para o mercado.
+    """
+    init_list(chat_id)
+    items = shopping_lists[chat_id]['items']
+    market_open = chat_id in market_hide_bought
+
+    if chat_id in menu_messages and not market_open:
+        await delete_message_safe(context, chat_id, menu_messages[chat_id])
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=get_main_menu_text(items),
+        parse_mode='HTML',
+        reply_markup=get_main_menu_keyboard(len(items) > 0, has_frequent_items(chat_id))
+    )
+    if not market_open:
+        menu_messages[chat_id] = msg.message_id
 
 
 async def refresh_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -1746,6 +1770,12 @@ async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_k
     if action == 'open':
         await query.answer()
         await send_stock_panel(context, chat_id)
+
+    # Volta para o menu da lista
+    elif action == 'list':
+        user_states[state_key] = STATE_NONE
+        await query.answer()
+        await send_list_menu(context, chat_id)
 
     # Tela principal do estoque
     elif action == 'menu':
