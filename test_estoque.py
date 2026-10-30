@@ -116,7 +116,8 @@ class FakeTelegram(BaseRequest):
 class StockTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         for store in (bot.shopping_lists, bot.user_states, bot.messages_to_delete, bot.menu_messages,
-                      bot.category_cache, bot.item_frequency, bot.stock, bot.stock_panels, bot.edit_target,
+                      bot.category_cache, bot.item_frequency, bot.stock, bot.stock_panels, bot.stock_seeded,
+                      bot.edit_target,
                       bot.freq_suggestions, bot.market_hide_bought):
             store.clear()
         if os.path.exists(bot.DATA_FILE):
@@ -717,6 +718,89 @@ class ListaTest(StockTestCase):
         await self.send('/clear')
         await self.press('Sim')
         self.assertEqual(self.shopping, [])
+
+
+class CargaInicialTest(StockTestCase):
+    async def test_carrega_a_lista_real_com_as_compras_aprovadas(self):
+        await bot.seed_groups(self.app)
+        self.assertEqual(len(self.stock), 62)
+        with open(bot.SEED_FILE, encoding='utf-8') as f:
+            self.assertEqual(bot.parse_stock_text(f.read())[1], [])
+        compras = {it['name']: it['quantity'] for it in self.shopping}
+        self.assertEqual(compras, {
+            'Pipoca (pacote)': 2, 'Café (pacote)': 5, 'Biscoito cream cracker (350 g)': 1,
+            'Biscoito de leite (350 g)': 1, 'Papel higiênico (pacote de 42 rolos)': 2,
+            'Shampoo (1 L)': 1, 'Condicionador (1 L)': 1,
+        })
+        self.assertEqual(self.stocked('Água sanitária grande')['category'], 'Limpeza')
+
+    async def test_publica_e_fixa_o_painel_no_grupo(self):
+        await bot.seed_groups(self.app)
+        self.assertIn('62 item(ns)', self.panel_text())
+        self.assertEqual(self.api.pinned, [self.panel_id])
+
+    async def test_nao_recarrega_no_proximo_deploy(self):
+        await bot.seed_groups(self.app)
+        await self.send('-arroz')
+        bot.stock.clear()
+        bot.stock_seeded.clear()
+        bot.load_data()
+        await bot.seed_groups(self.app)
+        self.assertEqual(self.stocked('arroz')['quantity'], 3)
+
+    async def test_nao_recarrega_se_a_familia_esvaziou_o_estoque(self):
+        await bot.seed_groups(self.app)
+        bot.stock[CHAT['id']].clear()
+        await bot.seed_groups(self.app)
+        self.assertEqual(self.stock, [])
+
+    async def test_estoque_esvaziado_nao_volta_no_proximo_deploy(self):
+        await bot.seed_groups(self.app)
+        bot.stock[CHAT['id']].clear()
+        bot.save_data()
+        bot.stock_seeded.clear()
+        bot.load_data()
+        await bot.seed_groups(self.app)
+        self.assertEqual(self.stock, [])
+
+    async def test_nao_mexe_em_estoque_ja_cadastrado(self):
+        await self.register('arroz 9/1/2')
+        await bot.seed_groups(self.app)
+        self.assertEqual(len(self.stock), 1)
+        self.assertEqual(self.stocked('arroz')['quantity'], 9)
+
+    async def test_nao_carrega_em_chat_privado(self):
+        bot.shopping_lists[42] = {'items': [], 'created_at': None}
+        await bot.seed_groups(self.app)
+        self.assertNotIn(42, bot.stock)
+
+    async def test_grupo_sem_acesso_nao_impede_a_subida(self):
+        original = self.api.do_request
+
+        async def bloqueia_envio(url, method, request_data=None, **kwargs):
+            if url.endswith('/sendMessage'):
+                return self.api._error('Forbidden: bot was kicked from the group chat')
+            return await original(url, method, request_data, **kwargs)
+
+        self.api.do_request = bloqueia_envio
+        await bot.seed_groups(self.app)
+        self.assertEqual(len(self.stock), 62)
+
+    async def test_sem_arquivo_nao_quebra(self):
+        with patch.object(bot, 'SEED_FILE', '/nao/existe.txt'):
+            await bot.seed_groups(self.app)
+        self.assertEqual(self.stock, [])
+
+    async def test_comando_manual_carrega_e_mostra_a_lista(self):
+        await self.send('/carregarestoque')
+        self.assertEqual(len(self.stock), 62)
+        self.assertIn('Café', self.menu_text())
+
+    async def test_comando_manual_nao_recarrega(self):
+        await self.send('/carregarestoque')
+        await self.send('-arroz')
+        await self.send('/carregarestoque')
+        self.assertEqual(self.stocked('arroz')['quantity'], 3)
 
 
 class PersistenciaTest(StockTestCase):

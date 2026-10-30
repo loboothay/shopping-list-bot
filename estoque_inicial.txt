@@ -1,0 +1,66 @@
+Mercearia
+Arroz (5 kg) 4/3/4
+Feijão (1 kg) 3/1/2
+Açúcar (5 kg) 1/1/2
+Farinha de trigo (5 kg) 1/1/1
+Macarrão (pacote) 14/8/12
+Lasanha (500 g) 1/1/2
+Óleo (900 ml) 6/4/6
+Sal (500 g) 3/1/2
+Sal grosso (pacote) 1/1/1
+Milho (lata) 3/2/3
+Atum natural (lata) 4/4/6
+Farelo de aveia (170 g) 3/2/3
+Creme de leite (caixinha) 12/8/12
+Ovos (cartela de 20) 2/2/3
+Extrato de tomate vidro (vidro de 910 g) 3/2/3
+Extrato de tomate pote (pote de 300 g) 6/4/6
+Água de coco (1 L) 1/1/1
+Maionese (unidade) 2/1/2
+Ketchup (unidade) 1/1/2
+Leite desnatado (1 L) 6/1/2
+Leite em pó desnatado (500 g) 2/2/3
+Pipoca (pacote) 1/2/3
+Chá (pacote) 3/1/2
+Café (pacote) 1/4/6
+Biscoito cream cracker (350 g) 1/2/2
+Biscoito de leite (350 g) 1/2/2
+Bebidas
+Água com gás 510 ml (engradado de 12) 3/2/3
+Água sem gás 510 ml (engradado de 12) 5/4/6
+Sprite zero 200 ml (fardo de 12) 3/2/3
+Fanta laranja zero lata (fardo de 6) 2/2/3
+Fanta uva zero lata (fardo de 6) 2/2/3
+Higiene
+Papel higiênico (pacote de 42 rolos) 0/1/2
+Shampoo (1 L) 0/1/1
+Condicionador (1 L) 0/1/1
+Protetor diário (pacote de 80) 2/1/2
+Absorvente (pacote de 32) 2/1/2
+Pasta de dente (caixa) 3/2/3
+Desodorante Herbíssimo (55 g) 1/1/2
+Sabonete Nívea (unidade) 12/4/6
+Sabonete Rexona (unidade) 6/2/3
+Lenço umedecido (pacote de 120) 3/2/3
+Cotonete (caixinha de 75) 4/1/1
+Limpeza
+Detergente líquido (unidade) 12/6/9
+Sabão em pó (2,4 kg) 3/2/3
+Amaciante (1,5 L) 3/2/3
+Tira-manchas Girando Sol (3 L) 1/1/1
+Água sanitária grande (2 L) 1/1/2
+Água sanitária pequena (1 L) 1/0/0
+Sabão para lavar louça (pote de 1 kg) 2/1/2
+Esponja de louça (pacote de 3) 3/2/3
+Esponja de limpeza (pacote de 4) 2/1/2
+Multiuso cloro ativo (500 ml) 1/1/2
+Multiuso Mr. Muscle refil (400 ml) 2/1/2
+Pato limpeza profunda (750 ml) 1/1/2
+Pato gel bastão (unidade) 3/2/3
+Diabo Verde granulado (300 g) 1/1/1
+Zip espuma p/ estofados (lata) 2/1/1
+Álcool (1 L) 2/1/1
+Álcool em gel (500 g) 2/1/1
+Luva de borracha (unidade) 5/1/2
+Saco de lixo 150 L (pacote de 10) 2/1/1
+Saco de lixo 15 L (pacote de 50) 2/1/2

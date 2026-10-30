@@ -59,6 +59,7 @@ item_frequency = {}
 # A quantidade é sempre em embalagens fechadas; 'package' descreve a embalagem ("5 kg")
 stock = {}
 stock_panels = {}  # chat_id -> message_id do painel do estoque, a mensagem fixada no grupo
+stock_seeded = set()  # chats que já passaram pela carga inicial: nunca recarregar por cima
 STOCK_MAX_QTY = 999
 STOCK_PAGE_SIZE = 30
 
@@ -70,6 +71,9 @@ market_hide_bought = {} # chat_id -> bool: no modo mercado, ocultar itens já co
 # Persistência em arquivo (Volume do Railway montado em /data)
 DATA_DIR = os.getenv('DATA_DIR', '/data')
 DATA_FILE = os.path.join(DATA_DIR, 'shopping_data.json')
+
+# Inventário inicial da casa, no mesmo formato do fluxo de Cadastrar
+SEED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'estoque_inicial.txt')
 
 # Categorias de supermercado, na ordem em que aparecem na lista
 CATEGORY_ORDER = [
@@ -501,6 +505,27 @@ def category_from_line(line: str) -> str | None:
     return next((cat for cat in CATEGORY_ORDER if _normalize(cat) == norm), None)
 
 
+def parse_stock_text(text: str) -> tuple:
+    """Lê um texto de cadastro. Retorna (entradas, linhas ignoradas).
+
+    Cada entrada é (nome, embalagem, atual, mínimo, ideal, seção escolhida ou None).
+    """
+    entries = []
+    ignored = []
+    section = None
+    for line in split_stock_lines(text):
+        header = category_from_line(line)
+        if header:
+            section = header
+            continue
+        entry = parse_stock_entry(line)
+        if entry is None or len(entry[0]) < 2:
+            ignored.append(line)
+        else:
+            entries.append((*entry, section))
+    return entries, ignored
+
+
 def upsert_stock_item(chat_id: int, name: str, package: str | None, category: str, qty: int,
                       min_qty: int | None, ideal: int | None) -> dict:
     """Cadastra o item ou, se já existe, atualiza só o que foi informado.
@@ -543,6 +568,24 @@ def remove_stock_item(chat_id: int, stock_item: dict) -> None:
         if entry.get('stock_id') == stock_item['id']:
             entry.pop('stock_id')
     get_stock(chat_id).remove(stock_item)
+
+
+def load_seed(chat_id: int) -> bool:
+    """Carrega o inventário inicial, uma única vez e só em chat com estoque vazio."""
+    if chat_id in stock_seeded:
+        return False
+    stock_seeded.add(chat_id)
+    save_data()
+    if get_stock(chat_id) or not os.path.exists(SEED_FILE):
+        return False
+
+    with open(SEED_FILE, 'r', encoding='utf-8') as f:
+        entries, _ = parse_stock_text(f.read())
+    for name, package, qty, min_qty, ideal, section in entries:
+        upsert_stock_item(chat_id, name, package, section or 'Outros', qty, min_qty, ideal)
+    save_data()
+    logger.info(f"✅ Estoque inicial carregado no chat {chat_id}: {len(entries)} item(ns).")
+    return True
 
 
 def move_stock_by_text(chat_id: int, text: str, sign: int) -> tuple:
@@ -590,6 +633,7 @@ def save_data() -> None:
             'item_frequency': item_frequency,
             'stock': {str(chat_id): items for chat_id, items in stock.items()},
             'stock_panels': {str(chat_id): msg_id for chat_id, msg_id in stock_panels.items()},
+            'stock_seeded': sorted(stock_seeded),
         }
         os.makedirs(DATA_DIR, exist_ok=True)
         tmp = DATA_FILE + '.tmp'
@@ -627,6 +671,7 @@ def load_data() -> None:
             stock[int(chat_id_str)] = items
         for chat_id_str, msg_id in payload.get('stock_panels', {}).items():
             stock_panels[int(chat_id_str)] = msg_id
+        stock_seeded.update(payload.get('stock_seeded', []))
         logger.info(f"✅ Dados carregados: {len(shopping_lists)} lista(s).")
     except Exception as e:
         logger.warning(f"⚠️ Falha ao carregar dados: {e}")
@@ -1134,6 +1179,24 @@ async def delete_own_pin_notice(update: Update, context: ContextTypes.DEFAULT_TY
         await delete_message_safe(context, update.effective_chat.id, update.message.message_id)
 
 
+async def seed_groups(application: Application) -> None:
+    """Na subida, carrega o inventário nos grupos que já usam o bot e publica o painel.
+
+    Um grupo de onde o bot saiu não pode impedir o bot de iniciar.
+    """
+    for chat_id in [chat_id for chat_id in shopping_lists if chat_id < 0]:
+        if load_seed(chat_id):
+            try:
+                await send_stock_panel(application, chat_id)
+            except TelegramError as e:
+                logger.warning(f"⚠️ Não consegui publicar o painel no chat {chat_id}: {e}")
+
+
+async def on_startup(application: Application) -> None:
+    await set_bot_commands(application)
+    await seed_groups(application)
+
+
 async def set_bot_commands(application: Application) -> None:
     """Define os comandos do bot"""
     commands = [
@@ -1318,6 +1381,21 @@ async def stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await delete_message_safe(context, chat_id, update.message.message_id)
     await send_stock_panel(context, chat_id)
+
+
+async def seed_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comando /carregarestoque: carga manual, para um grupo que a subida não encontrou."""
+    chat_id = update.effective_chat.id
+    await delete_message_safe(context, chat_id, update.message.message_id)
+
+    if load_seed(chat_id):
+        await send_stock_panel(context, chat_id)
+        await refresh_list_menu(context, chat_id)
+        return
+
+    msg = await context.bot.send_message(chat_id=chat_id, text="ℹ️ <b>O estoque deste chat já foi carregado.</b>", parse_mode='HTML')
+    await asyncio.sleep(3)
+    await delete_message_safe(context, chat_id, msg.message_id)
 
 
 async def stock_out_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1595,19 +1673,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif current_state == STATE_STOCK_ADD:
         user_states[state_key] = STATE_NONE
 
-        entries = []      # (nome, embalagem, atual, mínimo, ideal, seção escolhida ou None)
-        ignored = []
-        section = None
-        for line in split_stock_lines(text):
-            header = category_from_line(line)
-            if header:
-                section = header
-                continue
-            entry = parse_stock_entry(line)
-            if entry is None or len(entry[0]) < 2:
-                ignored.append(line)
-            else:
-                entries.append((*entry, section))
+        entries, ignored = parse_stock_text(text)
 
         organizing = await context.bot.send_message(chat_id=chat_id, text="🧠 <b>Organizando...</b>", parse_mode='HTML')
 
@@ -2192,6 +2258,7 @@ def register_handlers(application: Application) -> None:
     application.add_handler(CommandHandler("market", market_mode_command))
     application.add_handler(CommandHandler("estoque", stock_command))
     application.add_handler(CommandHandler("baixa", stock_out_command))
+    application.add_handler(CommandHandler("carregarestoque", seed_command))
     application.add_handler(CommandHandler("clear", clear_list_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
     application.add_handler(CallbackQueryHandler(button_callback))
@@ -2214,7 +2281,7 @@ def main() -> None:
     application = Application.builder().token(bot_token).build()
     register_handlers(application)
 
-    application.post_init = set_bot_commands
+    application.post_init = on_startup
     
     logger.info("🤖 Bot iniciado!")
     application.run_polling()
