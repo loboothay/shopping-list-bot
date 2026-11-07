@@ -170,6 +170,10 @@ interpreta o próximo texto digitado.
   - **Ligação com a lista**: `sync_stock_item` é o único ponto que liga estoque e lista. Se
     o item voltar ao mínimo, sai da lista. Item manual de mesmo nome é adotado sem reduzir a
     quantidade. Item marcado como comprado não é tocado.
+  - **Excluir produto** (`stock_del`, `STATE_STOCK_REMOVE`): apaga o produto do controle,
+    só por nome exato e só depois de "Sim, excluir" (`stock_delok`, ids em `pending_delete`).
+    A tela avisa que não é baixa. O botão já se chamou "Tirar do estoque" e foi usado por
+    engano como baixa: não voltar a esse nome.
   - **Entrada**: `restock_bought` roda em `market_finish` e `market_clear_bought`: soma ao
     estoque o que foi comprado e **tira o item da lista** (é o que evita somar duas
     vezes), e no fim reconcilia tudo com `sync_all_stock`. Itens fora do estoque continuam
