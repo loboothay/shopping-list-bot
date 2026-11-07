@@ -117,7 +117,7 @@ class StockTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         for store in (bot.shopping_lists, bot.user_states, bot.messages_to_delete, bot.menu_messages,
                       bot.category_cache, bot.item_frequency, bot.stock, bot.stock_panels, bot.stock_seeded,
-                      bot.edit_target,
+                      bot.edit_target, bot.pending_delete,
                       bot.freq_suggestions, bot.market_hide_bought):
             store.clear()
         if os.path.exists(bot.DATA_FILE):
@@ -640,8 +640,8 @@ class PainelTest(StockTestCase):
     async def test_tela_de_tirar_do_estoque_com_nomes_demais_nao_quebra(self):
         await self.register('\n'.join(f'M&M sabor {i} 5/1/2' for i in range(400)))
         await self.send('/estoque')
-        await self.press('Tirar do estoque')
-        self.assertIn('TIRAR DO ESTOQUE', self.panel_text())
+        await self.press('Excluir produto')
+        self.assertIn('EXCLUIR PRODUTO', self.panel_text())
 
 
 class MercadoTest(StockTestCase):
@@ -760,11 +760,12 @@ class ListaTest(StockTestCase):
         self.assertEqual(len(self.shopping), 1)
         self.assertEqual(self.shopping[0]['quantity'], 5)
 
-    async def test_tirar_do_estoque_mantem_na_lista_e_desvincula(self):
+    async def test_excluir_produto_mantem_na_lista_e_desvincula(self):
         await self.register('arroz 1/2/5')
         await self.send('/estoque')
-        await self.press('Tirar do estoque')
+        await self.press('Excluir produto')
         await self.send('arroz')
+        await self.press('Sim, excluir')
         self.assertEqual(self.stock, [])
         self.assertNotIn('stock_id', self.listed('arroz'))
 
@@ -874,6 +875,81 @@ class CargaInicialTest(StockTestCase):
         await self.send('-arroz')
         await self.send('/carregarestoque')
         self.assertEqual(self.stocked('arroz')['quantity'], 3)
+
+
+class ExcluirProdutoTest(StockTestCase):
+    async def excluir(self, nomes):
+        await self.send('/estoque')
+        await self.press('Excluir produto')
+        await self.send(nomes)
+
+    async def test_botao_nao_se_chama_mais_tirar(self):
+        await self.register('arroz 5/1/5')
+        nomes = [b['text'] for b in self.buttons_of(self.panel_id)]
+        self.assertFalse(any('Tirar' in n for n in nomes))
+        self.find_button('Excluir produto')
+
+    async def test_tela_avisa_que_nao_e_baixa_e_ensina_a_baixa(self):
+        await self.register('arroz 5/1/5')
+        await self.send('/estoque')
+        await self.press('Excluir produto')
+        self.assertIn('apaga o produto', self.panel_text())
+        self.assertIn('-1 nome', self.panel_text())
+
+    async def test_digitar_o_nome_so_pede_confirmacao(self):
+        await self.register('ovos 2/2/3')
+        await self.excluir('ovos')
+        self.assertEqual(len(self.stock), 1)
+        self.assertIn('EXCLUIR DE VEZ?', self.panel_text())
+
+    async def test_confirmar_exclui(self):
+        await self.register('ovos 2/2/3, arroz 4/3/4')
+        await self.excluir('ovos')
+        await self.press('Sim, excluir')
+        self.assertEqual([it['name'] for it in self.stock], ['arroz'])
+        self.assertIn('ESTOQUE', self.panel_text())
+
+    async def test_nao_voltar_mantem_o_produto(self):
+        await self.register('ovos 2/2/3')
+        await self.excluir('ovos')
+        await self.press('Não, voltar')
+        self.assertEqual(len(self.stock), 1)
+        await self.press_data('stock_delok', self.panel_id)
+        self.assertEqual(len(self.stock), 1)
+
+    async def test_varios_de_uma_vez_e_nome_desconhecido_avisado(self):
+        await self.register('ovos 2/2/3, arroz 4/3/4, feijão 3/1/2')
+        await self.excluir('ovos, arroz, unicornio')
+        self.assertIn('unicornio', self.panel_text())
+        await self.press('Sim, excluir')
+        self.assertEqual([it['name'] for it in self.stock], ['feijão'])
+
+    async def test_so_nomes_desconhecidos_nao_pede_confirmacao(self):
+        await self.register('ovos 2/2/3')
+        await self.excluir('unicornio')
+        self.assertNotIn('EXCLUIR DE VEZ?', self.panel_text())
+        self.assertEqual(len(self.stock), 1)
+
+    async def test_trecho_do_nome_nao_exclui(self):
+        await self.register('Fanta uva zero lata 2/2/3')
+        await self.excluir('fanta')
+        self.assertNotIn('EXCLUIR DE VEZ?', self.panel_text())
+        await self.press_data('stock_delok', self.panel_id)
+        self.assertEqual(len(self.stock), 1)
+
+    async def test_outra_pessoa_pode_confirmar_no_painel(self):
+        await self.register('ovos 2/2/3')
+        await self.excluir('ovos')
+        await self.press('Sim, excluir', user=OTHER)
+        self.assertEqual(self.stock, [])
+
+    async def test_confirmacao_com_painel_fechado_publica_outro(self):
+        await self.register('ovos 2/2/3')
+        await self.send('/estoque')
+        await self.press('Excluir produto')
+        self.api.messages.pop(self.panel_id)
+        await self.send('ovos')
+        self.assertIn('EXCLUIR DE VEZ?', self.panel_text())
 
 
 class PersistenciaTest(StockTestCase):

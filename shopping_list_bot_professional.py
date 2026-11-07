@@ -60,6 +60,7 @@ item_frequency = {}
 stock = {}
 stock_panels = {}  # chat_id -> message_id do painel do estoque, a mensagem fixada no grupo
 stock_seeded = set()  # chats que já passaram pela carga inicial: nunca recarregar por cima
+pending_delete = {}   # chat_id -> ids aguardando "Sim, excluir" (só memória)
 STOCK_MAX_QTY = 999
 STOCK_PAGE_SIZE = 30
 
@@ -819,7 +820,7 @@ def get_stock_menu_keyboard(chat_id: int):
 
     keyboard.append([InlineKeyboardButton("➕ Cadastrar / Atualizar", callback_data='stock_add')])
     if items:
-        keyboard.append([InlineKeyboardButton("🗑️ Tirar do estoque", callback_data='stock_del')])
+        keyboard.append([InlineKeyboardButton("🗑️ Excluir produto", callback_data='stock_del')])
     keyboard.append([InlineKeyboardButton("⬅️ Voltar ao menu", callback_data='stock_list')])
     return InlineKeyboardMarkup(keyboard)
 
@@ -1173,6 +1174,24 @@ async def send_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> No
     )
     if not market_open:
         menu_messages[chat_id] = msg.message_id
+
+
+async def show_on_panel(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, keyboard) -> None:
+    """Mostra uma tela no painel do estoque. Se o painel foi fechado, publica outro."""
+    if chat_id in stock_panels:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=stock_panels[chat_id],
+                text=text, parse_mode='HTML', reply_markup=keyboard
+            )
+            return
+        except BadRequest as e:
+            if 'not modified' in str(e).lower():
+                return
+
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=keyboard)
+    stock_panels[chat_id] = msg.message_id
+    save_data()
 
 
 async def refresh_list_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -1735,29 +1754,38 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await delete_message_safe(context, chat_id, msg.message_id)
         await refresh_views(context, chat_id)
 
-    # ESTOQUE: tirar itens (por nome, separados por vírgula)
+    # ESTOQUE: excluir produtos (nome exato, separados por vírgula). Só pede confirmação aqui
     elif current_state == STATE_STOCK_REMOVE:
         user_states[state_key] = STATE_NONE
 
-        removed, not_found = [], []
+        found, not_found = [], []
         for part in [p.strip() for p in text.split(',') if p.strip()]:
-            matches = [it for it in get_stock(chat_id) if same_item(it['name'], part)]
-            if matches:
-                remove_stock_item(chat_id, matches[0])
-                removed.append(matches[0]['name'])
-            else:
+            match = next((it for it in get_stock(chat_id) if same_item(it['name'], part)), None)
+            if match is None:
                 not_found.append(part)
-        save_data()
+            elif match not in found:
+                found.append(match)
 
-        linhas = []
-        if removed:
-            linhas.append(f"✅ Fora do estoque: {escape(', '.join(removed))}")
+        if not found:
+            pending_delete.pop(chat_id, None)
+            msg = await context.bot.send_message(chat_id=chat_id, text=f"❓ <b>Não encontrado(s):</b> {escape(', '.join(not_found))}", parse_mode='HTML')
+            await asyncio.sleep(2.5)
+            await delete_message_safe(context, chat_id, msg.message_id)
+            await refresh_views(context, chat_id)
+            return
+
+        pending_delete[chat_id] = [it['id'] for it in found]
+        texto = (
+            "⚠️ <b>EXCLUIR DE VEZ?</b>\n━━━━━━━━━━━━━━━\n"
+            f"{escape(', '.join(it['name'] for it in found))}\n\n"
+            "O produto sai do controle e não volta para a lista de compras."
+        )
         if not_found:
-            linhas.append(f"❓ Não encontrado(s): {escape(', '.join(not_found))}")
-        msg = await context.bot.send_message(chat_id=chat_id, text="\n".join(linhas) or "⚠️ <b>Nada para tirar.</b>", parse_mode='HTML')
-        await asyncio.sleep(2)
-        await delete_message_safe(context, chat_id, msg.message_id)
-        await refresh_views(context, chat_id)
+            texto += f"\n\n❓ Não encontrado(s): {escape(', '.join(not_found))}"
+        await show_on_panel(context, chat_id, texto, InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sim, excluir", callback_data='stock_delok')],
+            [InlineKeyboardButton("❌ Não, voltar", callback_data='stock_menu')],
+        ]))
 
 
 async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_key: str) -> None:
@@ -1787,6 +1815,7 @@ async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_k
     # Tela principal do estoque
     elif action == 'menu':
         user_states[state_key] = STATE_NONE
+        pending_delete.pop(chat_id, None)
         await query.answer()
         try:
             await query.edit_message_text(
@@ -1815,16 +1844,40 @@ async def handle_stock_button(query, context: ContextTypes.DEFAULT_TYPE, state_k
             reply_markup=get_stock_back_keyboard()
         )
 
-    # Tirar do estoque: pede os nomes
+    # Excluir produto: avisa que não é baixa e pede os nomes
     elif action == 'del':
         user_states[state_key] = STATE_STOCK_REMOVE
         await query.answer()
         await query.edit_message_text(
-            f"🗑️ <b>TIRAR DO ESTOQUE</b>\n━━━━━━━━━━━━━━━\n{get_stock_names_text(chat_id)}\n\n"
-            "Digite o(s) nome(s), separando por vírgula:",
+            "🗑️ <b>EXCLUIR PRODUTO</b>\n━━━━━━━━━━━━━━━\n"
+            "⚠️ Isto <b>apaga o produto</b> do controle. Para registrar que alguém pegou, "
+            "volte e toque na seção, ou mande <code>-1 nome</code> no grupo.\n\n"
+            f"{get_stock_names_text(chat_id)}\n\n"
+            "Digite o(s) nome(s) para excluir, separando por vírgula:",
             parse_mode='HTML',
             reply_markup=get_stock_back_keyboard()
         )
+
+    # Confirmação da exclusão
+    elif action == 'delok':
+        ids = pending_delete.pop(chat_id, [])
+        removed = []
+        for item_id in ids:
+            stock_item = next((it for it in get_stock(chat_id) if it['id'] == item_id), None)
+            if stock_item is not None:
+                remove_stock_item(chat_id, stock_item)
+                removed.append(stock_item['name'])
+        save_data()
+        await query.answer(f"Excluído: {', '.join(removed)}" if removed else "Nada para excluir.")
+        try:
+            await query.edit_message_text(
+                get_stock_menu_text(chat_id),
+                parse_mode='HTML',
+                reply_markup=get_stock_menu_keyboard(chat_id)
+            )
+        except BadRequest:
+            pass
+        await refresh_list_menu(context, chat_id)
 
     # Abrir uma categoria
     elif action == 'cat':
